@@ -574,7 +574,7 @@ fn matmul_parallelized(
         vectorize[nelts, dot](cols)
         C.store(i, tmp.reduce_add())
 
-    parallelize[compute_row](rt, rows, rt.parallelism_level())
+    parallelize[compute_row](rows, rt.parallelism_level())
 
 
 @always_inline
@@ -621,22 +621,38 @@ fn rope_rotation_llama(
 
     @parameter
     fn head_loop(i: Int):
-        # Simple vectorization with (head_size // 2) steps gave junk transformer output.
-        # Maybe because the nelt ranges end up overlapping between the steps.
-        for j in range(0, config.head_size, 2):
-            let fcr = freq_cis_real_row[j // 2]
-            let fci = freq_cis_imag_row[j // 2]
-            let q0 = state.q[i * head_size + j]
-            let q1 = state.q[i * head_size + j + 1]
-            state.q[i * head_size + j] = q0 * fcr - q1 * fci
-            state.q[i * head_size + j + 1] = q0 * fci + q1 * fcr
-            if i < config.n_kv_heads:
-                let k0 = state.k[i * head_size + j]
-                let k1 = state.k[i * head_size + j + 1]
-                state.k[i * head_size + j] = k0 * fcr - k1 * fci
-                state.k[i * head_size + j + 1] = k0 * fci + k1 * fcr
+        let outer_offset = i * head_size
 
-    parallelize[head_loop](state.rt, config.n_heads, state.rt.parallelism_level())
+        @parameter
+        fn inner_loop[_nelts: Int](k: Int):
+            let j = k * 2
+            # Frequency dim is half the head size so index is half of other tensors
+            # Draw one frequency for each pair to be rotated
+            let fcr = freq_cis_real_row.simd_load[_nelts](k)
+            let fci = freq_cis_imag_row.simd_load[_nelts](k)
+            let offset = outer_offset + j
+            # Make two strided draws offset by 1 for 'nelts' pairs
+            let q0 = state.q.data().offset(offset).simd_strided_load[_nelts](2)
+            let q1 = state.q.data().offset(offset + 1).simd_strided_load[_nelts](2)
+            state.q.data().offset(offset).simd_strided_store[_nelts](
+                q0 * fcr - q1 * fci, 2
+            )
+            state.q.data().offset(offset + 1).simd_strided_store[_nelts](
+                q0 * fci + q1 * fcr, 2
+            )
+            if i < config.n_kv_heads:
+                let k0 = state.k.data().offset(offset).simd_strided_load[_nelts](2)
+                let k1 = state.k.data().offset(offset + 1).simd_strided_load[_nelts](2)
+                state.k.data().offset(offset).simd_strided_store[_nelts](
+                    k0 * fcr - k1 * fci, 2
+                )
+                state.k.data().offset(offset + 1).simd_strided_store[_nelts](
+                    k0 * fci + k1 * fcr, 2
+                )
+
+        vectorize[nelts, inner_loop](head_size // 2)
+
+    parallelize[head_loop](config.n_heads, state.rt.parallelism_level())
 
 
 @always_inline
@@ -731,9 +747,7 @@ fn transformer(
 
                 vectorize[nelts, xb_accumulate](head_size)
 
-        parallelize[loop_over_heads](
-            state.rt, config.n_heads, state.rt.parallelism_level()
-        )
+        parallelize[loop_over_heads](config.n_heads, state.rt.parallelism_level())
         # Final matrix multiplication to get the output of the attention
         matmul(state.xb2, state.xb, TensorSlice(weights.wo, l), state.rt)
         # Residual connection back into x
