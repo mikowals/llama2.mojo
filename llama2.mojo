@@ -10,7 +10,7 @@ from random import rand
 from read import BufReader, File
 from runtime.llcl import num_cores, Runtime
 from sys import argv
-from tensor import Tensor, TensorShape, TensorSpec
+from testing import assert_equal, assert_true
 
 # The SIMD vector width.
 from sys.info import simdwidthof
@@ -25,86 +25,53 @@ alias PointerString = Pointer[UInt8]
 alias BufferPtrType = DTypePointer[DType.uint8]
 alias BufferPtrFloat32 = DTypePointer[DType.float32]
 alias PointerStrings = Pointer[PointerString]
-alias TensorF32 = Tensor[DType.float32]
 
 
-struct TensorSlice:
-    # Provides a view into a tensor representing a 1D slice on its first or first 2 dimensions.
-    # Same function signatures as Tensor but without owning the data.
+@register_passable("trivial")
+struct Weight[rank: Int]:
     var _data: BufferPtrFloat32
-    var _shape: TensorShape
+    var _shape: StaticIntTuple[rank]
 
-    fn __init__(inout self, t: TensorF32, layer: Int) raises:
-        let elements_per_layer = t.num_elements() // t.dim(0)
-        self._data = t.data().offset(layer * elements_per_layer)
-        if t.rank() == 2:
-            self._shape = TensorShape(t.dim(1))
-        elif t.rank() == 3:
-            self._shape = TensorShape(t.dim(1), t.dim(2))
-        else:
-            # Compiler complains if _shape not defined
-            self._shape = TensorShape(1)
-            raise Error("TensorSlice: rank greater than 3 not implemented.")
+    fn __init__(data: BufferPtrFloat32, shape: StaticIntTuple[rank]) -> Self:
+        return Self {_data: data, _shape: shape}
 
-    fn __init__(inout self, t: TensorF32, layer: Int, row: Int) raises:
-        let elements_per_layer = t.num_elements() // t.dim(0)
-        let elements_per_row = elements_per_layer // t.dim(1)
-        self._data = t.data().offset(
-            layer * elements_per_layer + row * elements_per_row
-        )
-        if t.rank() == 3:
-            self._shape = TensorShape(t.dim(2))
-        elif t.rank() == 1:
-            # Compiler complains if _shape not defined
-            self._shape = TensorShape(1)
-            raise Error(
-                "Trying to slice a 1D Tensor by layer and row.  This requires a 3D"
-                " Tensor."
-            )
-        else:
-            # Compiler complains if _shape not defined
-            self._shape = TensorShape(1)
-            raise Error("TensorSlice: rank greater than 3 not implemented.")
+    fn __init__(shape: StaticIntTuple[rank]) -> Self:
+        var num_elements = 1
+        for ii in range(rank):
+            num_elements *= shape[ii]
 
-    fn data(self) -> BufferPtrFloat32:
-        return self._data
-
-    fn shape(self) -> TensorShape:
-        return self._shape
+        let data = BufferPtrFloat32.alloc(num_elements)
+        return Self {_data: data, _shape: shape}
 
     fn num_elements(self) -> Int:
-        return self._shape.num_elements()
+        var num_elements = 1
+        for ii in range(rank):
+            num_elements *= self._shape[ii]
+        return num_elements
 
-    fn dim(self, idx: Int) -> Int:
-        return self._shape[idx]
+    @always_inline
+    fn __getitem__(self, index: Int) -> SIMD[DType.float32, 1]:
+        return self._data.simd_load[1](index)
 
-    fn rank(self) -> Int:
-        return self._shape.rank()
+    @always_inline
+    fn __setitem__(inout self, index: Int, val: SIMD[DType.float32, 1]):
+        return self._data.simd_store[1](index, val)
 
-    fn simd_load[nelts: Int](self, idx: Int) -> SIMD[DType.float32, nelts]:
-        return self._data.simd_load[nelts](idx)
+    @always_inline
+    fn simd_load[nelts: Int](self, offset: Int) -> SIMD[DType.float32, nelts]:
+        return self._data.simd_load[nelts](offset)
 
-    fn simd_load[nelts: Int](self, *indices: Int) -> SIMD[DType.float32, nelts]:
-        if len(VariadicList(indices)) > 2:
-            print(
-                "Warning: TensorSlice only supports 1D and 2D indexing.  Results are"
-                " unlikely to be correct."
-            )
-        return self.simd_load[nelts](indices[0] * self._shape[1] + indices[1])
+    @always_inline
+    fn simd_store[nelts: Int](self, offset: Int, val: SIMD[DType.float32, nelts]):
+        return self._data.simd_store[nelts](offset, val)
 
-    fn simd_load[
-        nelts: Int
-    ](self, indices: StaticIntTuple[2]) -> SIMD[DType.float32, nelts]:
-        return self._data.simd_load[nelts](indices[0] * self._shape[1] + indices[1])
+    @always_inline
+    fn dim(self, index: Int) -> Int:
+        return self._shape[index]
 
-    fn __getitem__(self, idx: Int) -> SIMD[DType.float32, 1]:
-        return self._data.simd_load[1](idx)
-
-    fn simd_store[nelts: Int](self, idx: Int, val: SIMD[DType.float32, nelts]):
-        return self._data.simd_store[nelts](idx, val)
-
-    fn __setitem__(self, idx: Int, val: SIMD[DType.float32, 1]):
-        return self.simd_store[1](idx, val)
+    @always_inline
+    fn data(self) -> BufferPtrFloat32:
+        return self._data
 
 
 fn read_val_int(inout buf: FileBuf) raises -> Int:
@@ -220,14 +187,13 @@ struct FileBuf:
     var offset: Int
     var size: Int
 
+    @always_inline
     fn __init__(inout self):
         self.data = BufferPtrType()
         self.offset = 0
         self.size = 0
 
-    fn __del__(owned self):
-        self.data.free()
-
+    @always_inline
     fn move_offset(inout self, size: Int) raises:
         let new_offset = self.offset + size
         if new_offset > self.size:
@@ -236,11 +202,13 @@ struct FileBuf:
             raise Error("Resulting offset will be before the beginning of the FileBuf")
         self.offset = new_offset
 
+    @always_inline
     fn bitcast_offset_f32(inout self, size: Int) raises -> BufferPtrFloat32:
         let ret = self.data.offset(self.offset).bitcast[DType.float32]()
         self.move_offset(size * sizeof[DType.float32]())
         return ret
 
+    @always_inline
     fn get_offset(self) raises -> Int:
         if self.offset > self.size:
             raise Error("Offset is past the end of the FileBuf")
@@ -249,6 +217,7 @@ struct FileBuf:
         return self.offset
 
 
+@always_inline
 fn wrap(token: PointerString) -> PointerString:
     if string_compare(token, str_to_ptr("\\n")) == 0:
         return str_to_ptr("<0x0A>")
@@ -287,6 +256,7 @@ struct Tokenizer:
         return None
 
     # sort vocab by string_compare
+    @always_inline
     fn sort(inout self) -> None:
         if len(self.sorted_indices) < self.vocab_size:
             self.sorted_indices = DynamicVector[Int](self.vocab_size)
@@ -300,6 +270,7 @@ struct Tokenizer:
         return None
 
     # Binary search that returns -1 if string is not found
+    @always_inline
     fn find(inout self, token_o: PointerString) -> Int:
         let token = wrap(token_o)
         let n = self.vocab_size
@@ -331,6 +302,7 @@ struct Config:
     var seq_len: Int
     var head_size: Int
 
+    @always_inline
     fn __init__(inout self):
         self.dim = 0
         self.hidden_dim = 0
@@ -345,89 +317,108 @@ struct Config:
 
 
 struct RunState:
-    var x: TensorF32  # activation at current time stamp (dim,)
-    var xb: TensorF32  # same, but inside a residual branch (dim,)
-    var xb2: TensorF32  # an additional buffer just for convenience (dim,)
-    var hb: TensorF32  # buffer for hidden dimension in the ffn (hidden_dim,)
-    var hb2: TensorF32  # buffer for hidden dimension in the ffn (hidden_dim,)
-    var q: TensorF32  # query (dim,)
-    var k: TensorSlice  # key (kv_dim,)
-    var v: TensorSlice  # value (kv_dim,)
-    var att: TensorF32  # buffer for scores/attention values (n_heads, seq_len)
-    var logits: TensorF32  # output logits
-    var key_cache: TensorF32  # (layer, seq_len, dim)
-    var value_cache: TensorF32  # (layer, seq_len, dim)
+    var x: Weight[1]  # activation at current time stamp (dim,)
+    var xb: Weight[1]  # same, but inside a residual branch (dim,)
+    var xb2: Weight[1]  # an additional buffer just for convenience (dim,)
+    var hb: Weight[1]  # buffer for hidden dimension in the ffn (hidden_dim,)
+    var hb2: Weight[1]  # buffer for hidden dimension in the ffn (hidden_dim,)
+    var q: Weight[1]  # query (dim,)
+    var k: Weight[1]  # key (kv_dim,)
+    var v: Weight[1]  # value (kv_dim,)
+    var att: Weight[2]  # buffer for scores/attention values (n_heads, seq_len)
+    var logits: Weight[1]  # output logits
+    var key_cache: Weight[3]  # (layer, seq_len, dim)
+    var value_cache: Weight[3]  # (layer, seq_len, dim)
     var rt: Runtime
 
+    @always_inline
     fn __init__(inout self, config: Config) raises:
-        self.x = TensorF32(config.dim)
-        self.xb = TensorF32(config.dim)
-        self.xb2 = TensorF32(config.dim)
-        self.hb = TensorF32(config.hidden_dim)
-        self.hb2 = TensorF32(config.hidden_dim)
-        self.q = TensorF32(config.dim)
-        self.att = TensorF32(config.n_heads, config.seq_len)
-        self.logits = TensorF32(config.vocab_size)
-        self.key_cache = TensorF32(config.n_layers, config.seq_len, config.kv_dim)
-        self.value_cache = TensorF32(config.n_layers, config.seq_len, config.kv_dim)
+        self.x = Weight[1](StaticIntTuple[1](config.dim))
+        self.xb = Weight[1](StaticIntTuple[1](config.dim))
+        self.xb2 = Weight[1](StaticIntTuple[1](config.dim))
+        self.hb = Weight[1](StaticIntTuple[1](config.hidden_dim))
+        self.hb2 = Weight[1](StaticIntTuple[1](config.hidden_dim))
+        self.q = Weight[1](StaticIntTuple[1](config.dim))
+        self.att = Weight[2](StaticIntTuple[2](config.n_heads, config.seq_len))
+        self.logits = Weight[1](config.vocab_size)
+        self.key_cache = Weight[3](
+            StaticIntTuple[3](config.n_layers, config.seq_len, config.kv_dim)
+        )
+        self.value_cache = Weight[3](
+            StaticIntTuple[3](config.n_layers, config.seq_len, config.kv_dim)
+        )
         # So their updates flow to the caches, k and v are slices with shared memory.
         # Initialize with placeholders. The real tensors reference layer and position during forward pass.
-        self.k = TensorSlice(TensorF32(TensorShape(1, config.kv_dim)), 1)
-        self.v = TensorSlice(TensorF32(TensorShape(1, config.kv_dim)), 1)
+        self.k = Weight[1](StaticIntTuple[1](config.kv_dim))
+        self.v = Weight[1](StaticIntTuple[1](config.kv_dim))
         self.rt = Runtime(num_cores())
 
 
 struct TransformerWeights:
-    var token_embedding_table: TensorF32
-    var freq_cis_real: TensorF32
-    var freq_cis_imag: TensorF32
-    var rms_att_weight: TensorF32
-    var wq: TensorF32
-    var wk: TensorF32
-    var wv: TensorF32
-    var wo: TensorF32
-    var rms_ffn_weight: TensorF32
-    var w1: TensorF32
-    var w3: TensorF32
-    var w2: TensorF32
-    var rms_final_weight: TensorF32
-    var wcls: TensorF32
+    var token_embedding_table: Weight[2]
+    var freq_cis_real: DynamicVector[Weight[1]]
+    var freq_cis_imag: DynamicVector[Weight[1]]
+    var rms_att_weight: DynamicVector[Weight[1]]
+    var wq: DynamicVector[Weight[2]]
+    var wk: DynamicVector[Weight[2]]
+    var wv: DynamicVector[Weight[2]]
+    var wo: DynamicVector[Weight[2]]
+    var rms_ffn_weight: DynamicVector[Weight[1]]
+    var w1: DynamicVector[Weight[2]]
+    var w3: DynamicVector[Weight[2]]
+    var w2: DynamicVector[Weight[2]]
+    var rms_final_weight: Weight[1]
+    var wcls: Weight[2]
 
+    @always_inline
     fn __init__(
         inout self, config: Config, shared_weights: Int, inout buf: FileBuf
     ) raises:
-        fn load_weights(inout buf: FileBuf, *dims: Int) raises -> TensorF32:
-            # Ensure returned Tensor doesn't share a pointer with FileBuf
-            let shape = TensorShape(dims)
-            let result_data = BufferPtrFloat32.alloc(shape.num_elements())
-            memcpy(
-                result_data,
-                buf.bitcast_offset_f32(shape.num_elements()),
-                shape.num_elements(),
-            )
-            return TensorF32(result_data, shape)
+        fn load_weights[
+            rank: Int
+        ](inout buf: FileBuf, layers: Int, *dims: Int) raises -> DynamicVector[
+            Weight[rank]
+        ]:
+            let shape = StaticIntTuple[rank](dims)
+            var v = DynamicVector[Weight[rank]](layers)
+            var num_elements = 1
+            for ii in range(rank):
+                num_elements *= shape[ii]
+            for ii in range(layers):
+                v[ii] = Weight[rank](buf.bitcast_offset_f32(num_elements), shape)
 
-        self.token_embedding_table = load_weights(buf, config.vocab_size, config.dim)
-        self.rms_att_weight = load_weights(buf, config.n_layers, config.dim)
-        self.wq = load_weights(buf, config.n_layers, config.dim, config.dim)
-        self.wk = load_weights(buf, config.n_layers, config.kv_dim, config.dim)
-        self.wv = load_weights(buf, config.n_layers, config.kv_dim, config.dim)
-        self.wo = load_weights(buf, config.n_layers, config.dim, config.dim)
-        self.rms_ffn_weight = load_weights(buf, config.n_layers, config.dim)
-        self.w1 = load_weights(buf, config.n_layers, config.hidden_dim, config.dim)
-        self.w2 = load_weights(buf, config.n_layers, config.dim, config.hidden_dim)
-        self.w3 = load_weights(buf, config.n_layers, config.hidden_dim, config.dim)
-        self.rms_final_weight = load_weights(buf, config.dim)
+            return v
+
+        self.token_embedding_table = Weight[2](
+            buf.bitcast_offset_f32(config.vocab_size * config.dim),
+            StaticIntTuple[2](config.vocab_size, config.dim),
+        )
+        self.rms_att_weight = load_weights[1](buf, config.n_layers, config.dim)
+        self.wq = load_weights[2](buf, config.n_layers, config.dim, config.dim)
+        self.wk = load_weights[2](buf, config.n_layers, config.kv_dim, config.dim)
+        self.wv = load_weights[2](buf, config.n_layers, config.kv_dim, config.dim)
+        self.wo = load_weights[2](buf, config.n_layers, config.dim, config.dim)
+        self.rms_ffn_weight = load_weights[1](buf, config.n_layers, config.dim)
+        self.w1 = load_weights[2](buf, config.n_layers, config.hidden_dim, config.dim)
+        self.w2 = load_weights[2](buf, config.n_layers, config.dim, config.hidden_dim)
+        self.w3 = load_weights[2](buf, config.n_layers, config.hidden_dim, config.dim)
+        self.rms_final_weight = Weight[1](
+            buf.bitcast_offset_f32(config.dim), StaticIntTuple[1](config.dim)
+        )
         # maybe need modifying for different model
         # config.head_size // 2 for stories and tinyllama-1.1
-        self.freq_cis_real = load_weights(buf, config.seq_len, config.head_size // 2)
-        self.freq_cis_imag = load_weights(buf, config.seq_len, config.head_size // 2)
+        self.freq_cis_real = load_weights[1](buf, config.seq_len, config.head_size // 2)
+        self.freq_cis_imag = load_weights[1](buf, config.seq_len, config.head_size // 2)
         if shared_weights:
             self.wcls = self.token_embedding_table
         else:
-            self.wcls = load_weights(buf, config.vocab_size, config.dim)
+            self.wcls = Weight[2](
+                buf.bitcast_offset_f32(config.vocab_size * config.dim),
+                StaticIntTuple[2](config.vocab_size, config.dim),
+            )
 
 
+@always_inline
 fn read_file(file_name: String, inout buf: FileBuf) raises:
     let _os = Python.import_module("os")
     let ff_size = _os.path.getsize(file_name)
@@ -450,6 +441,7 @@ fn read_file(file_name: String, inout buf: FileBuf) raises:
     return None
 
 
+@always_inline
 fn config_init(inout config: Config, inout buf: FileBuf) raises:
     config.dim = read_val_int(buf)
     config.hidden_dim = read_val_int(buf)
@@ -465,7 +457,7 @@ fn config_init(inout config: Config, inout buf: FileBuf) raises:
 
 
 @always_inline
-fn accum(inout a: TensorF32, b: TensorF32) -> None:
+fn accum(inout a: Weight[1], b: Weight[1]) -> None:
     let size = a.dim(0)
 
     @parameter
@@ -477,7 +469,7 @@ fn accum(inout a: TensorF32, b: TensorF32) -> None:
 
 @always_inline
 fn rmsnorm(
-    inout o: BufferPtrFloat32, x: BufferPtrFloat32, weight: BufferPtrFloat32, size: Int
+    o: BufferPtrFloat32, x: BufferPtrFloat32, weight: BufferPtrFloat32, size: Int
 ) -> None:
     # Calculate sum of squares
     var tmp = SIMD[DType.float32, nelts](0)
@@ -505,22 +497,17 @@ fn rmsnorm(
 
 
 @always_inline
-fn rmsnorm(inout o: TensorF32, x: TensorF32, weight: TensorF32):
-    rmsnorm(o._ptr, x.data(), weight.data(), weight.dim(weight.rank() - 1))
+fn rmsnorm(o: Weight[1], x: Weight[1], weight: Weight[1]):
+    rmsnorm(o.data(), x.data(), weight.data(), weight.dim(weight.dim(0)))
 
 
 @always_inline
-fn rmsnorm(inout o: TensorF32, x: TensorF32, weight: TensorSlice):
-    rmsnorm(o._ptr, x.data(), weight.data(), weight.dim(weight.rank() - 1))
+fn softmax(x: Weight[1]) -> None:
+    softmax(x.data(), 0, x._shape[0])
 
 
 @always_inline
-fn softmax(inout x: TensorF32) -> None:
-    softmax(x, 0, x.dim(0))
-
-
-@always_inline
-fn softmax(inout x: TensorF32, start: Int, end: Int):
+fn softmax(x: BufferPtrFloat32, start: Int, end: Int):
     var max_val: Float32 = -1e9
 
     @parameter
@@ -578,33 +565,10 @@ fn matmul_parallelized(
 
 
 @always_inline
-fn matmul(C: TensorF32, A: TensorF32, B: TensorF32, rt: Runtime) raises:
+fn matmul(C: Weight[1], A: Weight[1], B: Weight[2], rt: Runtime) raises:
     # B (d,n) @ A (n,) -> C (d,)
-    matmul_dimension_checks(A.shape(), B.shape())
+    # matmul_dimension_checks(A._shape, B._shape)
     matmul_parallelized(C.data(), A.data(), B.data(), B.dim(0), B.dim(1), rt)
-
-
-@always_inline
-fn matmul(C: TensorF32, A: TensorF32, B: TensorSlice, rt: Runtime) raises:
-    # B (d,n) @ A (n,) -> C (d,)
-    matmul_dimension_checks(A.shape(), B.shape())
-    matmul_parallelized(C.data(), A.data(), B.data(), B.dim(0), B.dim(1), rt)
-
-
-@always_inline
-fn matmul(C: TensorSlice, A: TensorF32, B: TensorSlice, rt: Runtime) raises:
-    # B (d,n) @ A (n,) -> C (d,)
-    matmul_dimension_checks(A.shape(), B.shape())
-    matmul_parallelized(C.data(), A.data(), B.data(), B.dim(0), B.dim(1), rt)
-
-
-fn matmul_dimension_checks(a: TensorShape, b: TensorShape) raises:
-    if a[0] != b[1]:
-        raise Error(
-            "matmul dimension mismatch. A rows (dim 0) not equal to B columns (dim 1)"
-        )
-    if b.rank() != 2:
-        raise Error("matmul expects B to be a 2D matrix")
 
 
 # Apply RoPE rotation to the q and k vectors for each head
@@ -612,8 +576,8 @@ fn matmul_dimension_checks(a: TensorShape, b: TensorShape) raises:
 @always_inline
 fn rope_rotation_llama(
     inout state: RunState,
-    freq_cis_real_row: TensorSlice,
-    freq_cis_imag_row: TensorSlice,
+    freq_cis_real_row: Weight[1],
+    freq_cis_imag_row: Weight[1],
     config: Config,
 ) -> None:
     # stories model, llama2
@@ -621,36 +585,20 @@ fn rope_rotation_llama(
 
     @parameter
     fn head_loop(i: Int):
-        let outer_offset = i * head_size
-
-        @parameter
-        fn inner_loop[_nelts: Int](k: Int):
-            let j = k * 2
-            # Frequency dim is half the head size so index is half of other tensors
-            # Draw one frequency for each pair to be rotated
-            let fcr = freq_cis_real_row.simd_load[_nelts](k)
-            let fci = freq_cis_imag_row.simd_load[_nelts](k)
-            let offset = outer_offset + j
-            # Make two strided draws offset by 1 for 'nelts' pairs
-            let q0 = state.q.data().offset(offset).simd_strided_load[_nelts](2)
-            let q1 = state.q.data().offset(offset + 1).simd_strided_load[_nelts](2)
-            state.q.data().offset(offset).simd_strided_store[_nelts](
-                q0 * fcr - q1 * fci, 2
-            )
-            state.q.data().offset(offset + 1).simd_strided_store[_nelts](
-                q0 * fci + q1 * fcr, 2
-            )
+        # Simple vectorization with (head_size // 2) steps gave junk transformer output.
+        # Maybe because the nelt ranges end up overlapping between the steps.
+        for j in range(0, config.head_size, 2):
+            let fcr = freq_cis_real_row[j // 2]
+            let fci = freq_cis_imag_row[j // 2]
+            let q0 = state.q[i * head_size + j]
+            let q1 = state.q[i * head_size + j + 1]
+            state.q[i * head_size + j] = q0 * fcr - q1 * fci
+            state.q[i * head_size + j + 1] = q0 * fci + q1 * fcr
             if i < config.n_kv_heads:
-                let k0 = state.k.data().offset(offset).simd_strided_load[_nelts](2)
-                let k1 = state.k.data().offset(offset + 1).simd_strided_load[_nelts](2)
-                state.k.data().offset(offset).simd_strided_store[_nelts](
-                    k0 * fcr - k1 * fci, 2
-                )
-                state.k.data().offset(offset + 1).simd_strided_store[_nelts](
-                    k0 * fci + k1 * fcr, 2
-                )
-
-        vectorize[nelts, inner_loop](head_size // 2)
+                let k0 = state.k[i * head_size + j]
+                let k1 = state.k[i * head_size + j + 1]
+                state.k[i * head_size + j] = k0 * fcr - k1 * fci
+                state.k[i * head_size + j + 1] = k0 * fci + k1 * fcr
 
     parallelize[head_loop](config.n_heads, state.rt.parallelism_level())
 
@@ -675,22 +623,28 @@ fn transformer(
     memcpy[DType.float32](state.x.data(), content_row, dim)
 
     # Pluck out the "pos" row of freq_cis_real and freq_cis_imag
-    let freq_cis_real_row = TensorSlice(weights.freq_cis_real, pos)
-    let freq_cis_imag_row = TensorSlice(weights.freq_cis_imag, pos)
+    let freq_cis_real_row = weights.freq_cis_real[pos]
+    let freq_cis_imag_row = weights.freq_cis_imag[pos]
 
     # Forward all the layers
     for l in range(config.n_layers):
         # Attention rmsnorm
-        rmsnorm(state.xb, state.x, TensorSlice(weights.rms_att_weight, l))
+        rmsnorm(state.xb, state.x, weights.rms_att_weight[l])
         # QKV matmuls for this position
-        matmul(state.q, state.xb, TensorSlice(weights.wq, l), state.rt)
+        matmul(state.q, state.xb, weights.wq[l], state.rt)
 
         let loff = l * config.seq_len * config.kv_dim
-        state.k = TensorSlice(state.key_cache, l, pos)
-        matmul(state.k, state.xb, TensorSlice(weights.wk, l), state.rt)
+        state.k = Weight[1](
+            state.key_cache.data().offset(loff + pos * config.kv_dim),
+            StaticIntTuple[1](config.kv_dim),
+        )
+        matmul(state.k, state.xb, weights.wk[l], state.rt)
 
-        state.v = TensorSlice(state.value_cache, l, pos)
-        matmul(state.v, state.xb, TensorSlice(weights.wv, l), state.rt)
+        state.v = Weight[1](
+            state.value_cache.data().offset(loff + pos * config.kv_dim),
+            StaticIntTuple[1](config.kv_dim),
+        )
+        matmul(state.v, state.xb, weights.wv[l], state.rt)
 
         # Apply RoPE rotation to the q and k vectors for each head
         rope_rotation_llama(state, freq_cis_real_row, freq_cis_imag_row, config)
@@ -727,7 +681,7 @@ fn transformer(
                 state.att[att_offset + t] = score
 
             # Softmax the scores to get attention weights, from 0..pos inclusively
-            softmax(state.att, att_offset, att_offset + pos + 1)
+            softmax(state.att.data(), att_offset, att_offset + pos + 1)
             # Weighted sum of the values, store back into xb
             let xb_offset = h * head_size
             for t in range(pos + 1):
@@ -749,16 +703,16 @@ fn transformer(
 
         parallelize[loop_over_heads](config.n_heads, state.rt.parallelism_level())
         # Final matrix multiplication to get the output of the attention
-        matmul(state.xb2, state.xb, TensorSlice(weights.wo, l), state.rt)
+        matmul(state.xb2, state.xb, weights.wo[l], state.rt)
         # Residual connection back into x
         accum(state.x, state.xb2)
         # FFN rmsnorm
-        rmsnorm(state.xb, state.x, TensorSlice(weights.rms_ffn_weight, l))
+        rmsnorm(state.xb, state.x, weights.rms_ffn_weight[l])
 
         # Calculate self.w1(x) and self.w3(x) for FFN
-        matmul(state.hb, state.xb, TensorSlice(weights.w1, l), state.rt)
+        matmul(state.hb, state.xb, weights.w1[l], state.rt)
 
-        matmul(state.hb2, state.xb, TensorSlice(weights.w3, l), state.rt)
+        matmul(state.hb2, state.xb, weights.w3[l], state.rt)
 
         @parameter
         fn silu[_nelts: Int](i: Int):
@@ -770,7 +724,7 @@ fn transformer(
 
         vectorize[nelts, silu](hidden_dim)
         # Final matrix multiplication to get the output of the FFN
-        matmul(state.xb, state.hb, TensorSlice(weights.w2, l), state.rt)
+        matmul(state.xb, state.hb, weights.w2[l], state.rt)
 
         # Residual connection
         accum(state.x, state.xb)
@@ -782,7 +736,8 @@ fn transformer(
     matmul(state.logits, state.x, weights.wcls, state.rt)
 
 
-fn argmax(v: TensorF32) -> Int:
+@always_inline
+fn argmax(v: Weight[1]) -> Int:
     # return argmax of v
     var max_i: Int = 0
     var max_p: Float32 = v[0]
@@ -793,7 +748,8 @@ fn argmax(v: TensorF32) -> Int:
     return max_i
 
 
-fn sample(probabilities: TensorF32) -> Int:
+@always_inline
+fn sample(probabilities: Weight[1]) -> Int:
     let n = probabilities.dim(0)
     # Sample index from probabilities, they must sum to 1
     # get random value within (min, max) float32 range
@@ -807,6 +763,7 @@ fn sample(probabilities: TensorF32) -> Int:
     return n - 1  # In case of rounding errors
 
 
+@always_inline
 fn bpe_encode(inout tokens: DynamicVector[Int], text: String, inout tok: Tokenizer):
     for pos in range(len(text)):
         let char = str_to_ptr(text[pos])
@@ -846,6 +803,7 @@ fn bpe_encode(inout tokens: DynamicVector[Int], text: String, inout tok: Tokeniz
         tokens = _tokens
 
 
+@always_inline
 fn str2num(d: Int) -> Int:
     # covert Hex to decimal
     if d >= ord("A"):
@@ -853,6 +811,7 @@ fn str2num(d: Int) -> Int:
     return d - ord("0")
 
 
+@always_inline
 fn print_str(s: PointerString):
     # print raw byte like <0x0A>
     if (s[1].to_int() == ord("0")) and (s[2].to_int() == ord("x")):
@@ -867,11 +826,13 @@ fn print_str(s: PointerString):
         p += 1
 
 
+@always_inline
 fn time_in_ms() -> Int:
     # Returns time in milliseconds for benchmarking the model speed
     return time.now() // 1_000_000
 
 
+@always_inline
 fn print_usage():
     print("Usage: mojo llama2.mojo <checkpoint> [options]")
     print(
@@ -886,11 +847,12 @@ fn print_usage():
     print("  -z          tokenizer path")
 
 
+@always_inline
 fn main() raises:
     print("num hardware threads: ", num_cores())
     print("SIMD vector width: ", nelts)
     var tokenizer = StringRef("tokenizer.bin")
-    var checkpoint = StringRef("stories15M.bin")
+    var checkpoint = StringRef("stories110M.bin")
     var temperature = 0.9
     var steps = 256
     var prompt = String("")
