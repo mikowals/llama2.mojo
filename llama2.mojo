@@ -297,12 +297,9 @@ struct RunState:
     ) raises:
         fn create_weight[
             rank: Int
-        ](*dims: Int) raises -> NDBuffer[rank, DimList(), DType.float32]:
-            let shape = StaticIntTuple[rank](dims)
-            var num_elements = 1
-            for ii in range(rank):
-                num_elements *= dims[ii]
-
+        ](*dims: Dim) raises -> NDBuffer[rank, DimList(), DType.float32]:
+            let shape = DimList(dims)
+            let num_elements = shape.product[rank]().get()
             return NDBuffer[rank, DimList(), DType.float32](
                 DTypePointer[DType.float32].alloc(num_elements), shape
             )
@@ -350,13 +347,11 @@ struct TransformerWeights:
     ) raises:
         fn load_weights[
             rank: Int
-        ](inout buf: FileBuf, *dims: Int) raises -> NDBuffer[
+        ](inout buf: FileBuf, *dims: Dim) raises -> NDBuffer[
             rank, DimList(), DType.float32
         ]:
-            let shape = StaticIntTuple[rank](dims)
-            var num_elements = 1
-            for ii in range(rank):
-                num_elements *= dims[ii]
+            let shape = DimList(dims)
+            let num_elements = shape.product[rank]().get()
             return NDBuffer[rank, DimList(), DType.float32](
                 buf.bitcast_offset_f32(num_elements), shape
             )
@@ -430,8 +425,8 @@ fn accum(
 
     @parameter
     fn _acc[_nelts: Int](j: Int):
-        a.data.simd_store[_nelts](
-            j, a.data.simd_load[_nelts](j) + b.data.simd_load[_nelts](j)
+        a.simd_store[_nelts](
+            StaticIntTuple[1](j), a.simd_load[_nelts](j) + b.simd_load[_nelts](j)
         )
 
     vectorize[nelts, _acc](size)
@@ -450,9 +445,9 @@ fn rmsnorm(
     @parameter
     fn _sum2[_nelts: Int](j: Int):
         if _nelts < nelts:
-            tmp[0] += (x.data.simd_load[_nelts](j) ** 2).reduce_add()
+            tmp[0] += (x.simd_load[_nelts](j) ** 2).reduce_add()
         else:
-            tmp += x.data.simd_load[nelts](j) ** 2
+            tmp += x.simd_load[nelts](j) ** 2
 
     vectorize[nelts, _sum2](size)
 
@@ -463,8 +458,8 @@ fn rmsnorm(
     # Normalize and scale
     @parameter
     fn _norm[_nelts: Int](j: Int):
-        let val = weight.data.simd_load[_nelts](j) * ss * x.data.simd_load[_nelts](j)
-        o.data.simd_store[_nelts](j, val)
+        let val = weight.simd_load[_nelts](j) * ss * x.simd_load[_nelts](j)
+        o.simd_store[_nelts](StaticIntTuple[1](j), val)
 
     vectorize[nelts, _norm](size)
 
@@ -526,15 +521,13 @@ fn matmul(
         fn dot[_nelts: Int](j: Int):
             if _nelts < nelts:  # take care of tail array elements with length <  nelts
                 tmp[0] += (
-                    A.data.simd_load[_nelts](j) * B.data.simd_load[_nelts](i * cols + j)
+                    A.simd_load[_nelts](j) * B.simd_load[_nelts](i, j)
                 ).reduce_add()
             else:
-                tmp += A.data.simd_load[nelts](j) * B.data.simd_load[nelts](
-                    i * cols + j
-                )
+                tmp += A.simd_load[nelts](j) * B.simd_load[nelts](i, j)
 
         vectorize[nelts, dot](cols)
-        C.data.store(i, tmp.reduce_add())
+        C[i] = tmp.reduce_add()
 
     parallelize[compute_row](rows, rt.parallelism_level())
 
@@ -558,15 +551,15 @@ fn rope_rotation_llama(
         for j in range(0, config.head_size, 2):
             let fcr = freq_cis_real_row[j // 2]
             let fci = freq_cis_imag_row[j // 2]
-            let q0 = state.q.data.load(i * head_size + j)
-            let q1 = state.q.data.load(i * head_size + j + 1)
-            state.q.data.store(i * head_size + j, q0 * fcr - q1 * fci)
-            state.q.data.store(i * head_size + j + 1, q0 * fci + q1 * fcr)
+            let q0 = state.q[i * head_size + j]
+            let q1 = state.q[i * head_size + j + 1]
+            state.q[i * head_size + j] = q0 * fcr - q1 * fci
+            state.q[i * head_size + j + 1] = q0 * fci + q1 * fcr
             if i < config.n_kv_heads:
-                let k0 = state.k.data.load(i * head_size + j)
-                let k1 = state.k.data.load(i * head_size + j + 1)
-                state.k.data.store(i * head_size + j, k0 * fcr - k1 * fci)
-                state.k.data.store(i * head_size + j + 1, k0 * fci + k1 * fcr)
+                let k0 = state.k[i * head_size + j]
+                let k1 = state.k[i * head_size + j + 1]
+                state.k[i * head_size + j] = k0 * fcr - k1 * fci
+                state.k[i * head_size + j + 1] = k0 * fci + k1 * fcr
 
     parallelize[head_loop](config.n_heads, state.rt.parallelism_level())
 
@@ -578,7 +571,7 @@ fn slice[
 ]:
     var offset_per_index = buf.num_elements()
     var offset = 0
-    var shape: DimList
+    let shape: DimList
     for ii in range(slice_dims):
         offset_per_index /= buf.dim(ii)
         offset += dims[ii] * offset_per_index
@@ -648,22 +641,22 @@ fn transformer(
             # Iterate over all timesteps, including the current one
             for t in range(pos + 1):
                 # Starting index of the key vector for this head and at this timestep
-                let k_offset = loff + t * kv_dim + (h // kv_mul) * head_size
+                let k_offset = (h // kv_mul) * head_size
                 # Calculate the attention score as the dot product of q and k
                 var score: Float32 = 0.0
 
                 @parameter
                 fn score_fn[_nelts: Int](i: Int):
                     score += (
-                        state.q.data.simd_load[_nelts](q_offset + i)
-                        * state.key_cache.data.simd_load[_nelts](k_offset + i)
+                        state.q.simd_load[_nelts](q_offset + i)
+                        * state.key_cache.simd_load[_nelts](l, t, k_offset + i)
                     ).reduce_add()
 
                 vectorize[nelts, score_fn](head_size)
                 score /= math.sqrt[DType.float32, 1](head_size)
 
                 # Save the score to the attention buffer
-                state.att.data.store(att_offset + t, score)
+                state.att[StaticIntTuple[2](h, t)] = score
 
             # Softmax the scores to get attention weights, from 0..pos inclusively
             softmax[2](state.att, att_offset, att_offset + pos + 1)
@@ -671,18 +664,18 @@ fn transformer(
             let xb_offset = h * head_size
             for t in range(pos + 1):
                 # Starting index of the value vector for this head and at this timestep
-                let v_offset = loff + t * kv_dim + (h // kv_mul) * head_size
+                let v_offset = (h // kv_mul) * head_size
 
                 # Get the attention weight for this timestep
-                let a = state.att.data.load(att_offset + t)
+                let a = state.att[h, t]
                 # Accumulate the weighted value into xb
 
                 @parameter
                 fn xb_accumulate[_nelts: Int](i: Int):
-                    let xbi = state.xb.data.simd_load[_nelts](
+                    let xbi = state.xb.simd_load[_nelts](
                         xb_offset + i
-                    ) + a * state.value_cache.data.simd_load[_nelts](v_offset + i)
-                    state.xb.data.simd_store[_nelts](xb_offset + i, xbi)
+                    ) + a * state.value_cache.simd_load[_nelts](l, t, v_offset + i)
+                    state.xb.simd_store[_nelts](StaticIntTuple[1](xb_offset + i), xbi)
 
                 vectorize[nelts, xb_accumulate](head_size)
 
@@ -701,12 +694,12 @@ fn transformer(
 
         @parameter
         fn silu[_nelts: Int](i: Int):
-            let initial_hb = state.hb.data.simd_load[_nelts](i)
+            let initial_hb = state.hb.simd_load[_nelts](i)
             # Apply SiLU activation function (silu(x) = x * sigmoid(x))
             let hbi = initial_hb * (1.0 / (1.0 + math.exp(-initial_hb)))
             # Elementwise multiply with w3(x)
-            state.hb.data.simd_store[_nelts](
-                i, hbi * state.hb2.data.simd_load[_nelts](i)
+            state.hb.simd_store[_nelts](
+                StaticIntTuple[1](i), hbi * state.hb2.simd_load[_nelts](i)
             )
 
         vectorize[nelts, silu](hidden_dim)
