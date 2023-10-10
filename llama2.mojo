@@ -6,11 +6,13 @@ from memory import memset_zero, memcpy
 from memory.buffer import Buffer
 from memory.unsafe import DTypePointer
 from python import Python
-from random import rand
+from random import rand, random_ui64
 from read import BufReader, File
 from runtime.llcl import num_cores, Runtime
 from sys import argv
 from tensor import Tensor, TensorShape, TensorSpec
+from benchmark import Benchmark, keep
+from autotune import autotune, search
 
 # The SIMD vector width.
 from sys.info import simdwidthof
@@ -21,7 +23,7 @@ import time
 
 var cores = 0
 
-alias nelts = (2*simdwidthof[DType.float32]())
+alias nelts = simdwidthof[DType.float32]()
 
 alias PointerString = Pointer[UInt8]
 alias BufferPtrType = DTypePointer[DType.uint8]
@@ -360,7 +362,6 @@ struct RunState:
     var key_cache: TensorF32  # (layer, seq_len, dim)
     var value_cache: TensorF32  # (layer, seq_len, dim)
 
-
     fn __init__(inout self, config: Config) raises:
         self.x = TensorF32(config.dim)
         self.xb = TensorF32(config.dim)
@@ -376,7 +377,6 @@ struct RunState:
         # Initialize with placeholders. The real tensors reference layer and position during forward pass.
         self.k = TensorSlice(TensorF32(TensorShape(1, config.kv_dim)), 1)
         self.v = TensorSlice(TensorF32(TensorShape(1, config.kv_dim)), 1)
-
 
 
 struct TransformerWeights:
@@ -551,8 +551,9 @@ fn softmax(inout x: TensorF32, start: Int, end: Int):
     vectorize[nelts, _norm](end - start)
 
 
-@always_inline
-fn matmul_parallelized(C: BufferPtrFloat32,A: BufferPtrFloat32,B: BufferPtrFloat32,rows: Int,cols: Int,):
+fn matmul_parallelized[
+    workers: Int
+](C: BufferPtrFloat32, A: BufferPtrFloat32, B: BufferPtrFloat32, rows: Int, cols: Int,):
     @parameter
     fn compute_row(i: Int):
         var tmp = SIMD[DType.float32, nelts](0)
@@ -561,40 +562,33 @@ fn matmul_parallelized(C: BufferPtrFloat32,A: BufferPtrFloat32,B: BufferPtrFloat
         fn dot[_nelts: Int](j: Int):
             if _nelts < nelts:  # take care of tail array elements with length <  nelts
                 tmp[0] += (
-                A.simd_load[_nelts](j) * B.simd_load[_nelts](i * cols + j)
+                    A.simd_load[_nelts](j) * B.simd_load[_nelts](i * cols + j)
                 ).reduce_add()
             else:
                 tmp += A.simd_load[nelts](j) * B.simd_load[nelts](i * cols + j)
 
         vectorize[nelts, dot](cols)
         C.store(i, tmp.reduce_add())
-    
 
-    parallelize[compute_row](rows,cores)
+    parallelize[compute_row](rows, workers)
 
-    
 
-    
-    
-@always_inline
-fn matmul(C: TensorF32, A: TensorF32, B: TensorF32) raises:
+fn matmul[workers: Int](C: TensorF32, A: TensorF32, B: TensorF32) raises:
     # B (d,n) @ A (n,) -> C (d,)
     matmul_dimension_checks(A.shape(), B.shape())
-    matmul_parallelized(C.data(), A.data(), B.data(), B.dim(0), B.dim(1))
+    matmul_parallelized[workers](C.data(), A.data(), B.data(), B.dim(0), B.dim(1))
 
 
-@always_inline
-fn matmul(C: TensorF32, A: TensorF32, B: TensorSlice) raises:
+fn matmul[workers: Int](C: TensorF32, A: TensorF32, B: TensorSlice) raises:
     # B (d,n) @ A (n,) -> C (d,)
     matmul_dimension_checks(A.shape(), B.shape())
-    matmul_parallelized(C.data(), A.data(), B.data(), B.dim(0), B.dim(1))
+    matmul_parallelized[workers](C.data(), A.data(), B.data(), B.dim(0), B.dim(1))
 
 
-@always_inline
-fn matmul(C: TensorSlice, A: TensorF32, B: TensorSlice) raises:
+fn matmul[workers: Int](C: TensorSlice, A: TensorF32, B: TensorSlice) raises:
     # B (d,n) @ A (n,) -> C (d,)
     matmul_dimension_checks(A.shape(), B.shape())
-    matmul_parallelized(C.data(), A.data(), B.data(), B.dim(0), B.dim(1))
+    matmul_parallelized[workers](C.data(), A.data(), B.data(), B.dim(0), B.dim(1))
 
 
 fn matmul_dimension_checks(a: TensorShape, b: TensorShape) raises:
@@ -609,7 +603,9 @@ fn matmul_dimension_checks(a: TensorShape, b: TensorShape) raises:
 # Apply RoPE rotation to the q and k vectors for each head
 # rotate odd and even dim
 @always_inline
-fn rope_rotation_llama(
+fn rope_rotation_llama[
+    workers: Int
+](
     inout state: RunState,
     freq_cis_real_row: TensorSlice,
     freq_cis_imag_row: TensorSlice,
@@ -617,8 +613,9 @@ fn rope_rotation_llama(
 ) -> None:
     # stories model, llama2
     let head_size = config.head_size
+
     @parameter
-    fn head_loop(i:Int):
+    fn head_loop(i: Int):
         # Simple vectorization with (head_size // 2) steps gave junk transformer output.
         # Maybe because the nelt ranges end up overlapping between the steps.
         for j in range(0, config.head_size, 2):
@@ -633,11 +630,11 @@ fn rope_rotation_llama(
                 let k1 = state.k[i * head_size + j + 1]
                 state.k[i * head_size + j] = k0 * fcr - k1 * fci
                 state.k[i * head_size + j + 1] = k0 * fci + k1 * fcr
-    parallelize[head_loop](config.n_heads,cores)
+
+    parallelize[head_loop](config.n_heads, workers)
 
 
-
-@always_inline
+@adaptive
 fn transformer(
     token: Int,
     pos: Int,
@@ -652,6 +649,8 @@ fn transformer(
     let kv_dim = config.kv_dim
     let kv_mul = config.kv_mul
 
+    alias workers = autotune(1, 2, 4, 8, 16)
+
     # Copy the token embedding into x
     let content_row = weights.token_embedding_table.data().offset(token * dim)
     memcpy[DType.float32](state.x.data(), content_row, dim)
@@ -665,23 +664,25 @@ fn transformer(
         # Attention rmsnorm
         rmsnorm(state.xb, state.x, TensorSlice(weights.rms_att_weight, l))
         # QKV matmuls for this position
-        matmul(state.q, state.xb, TensorSlice(weights.wq, l))
+        matmul[workers](state.q, state.xb, TensorSlice(weights.wq, l))
 
         let loff = l * config.seq_len * config.kv_dim
         state.k = TensorSlice(state.key_cache, l, pos)
-        matmul(state.k, state.xb, TensorSlice(weights.wk, l))
+        matmul[workers](state.k, state.xb, TensorSlice(weights.wk, l))
 
         state.v = TensorSlice(state.value_cache, l, pos)
-        matmul(state.v, state.xb, TensorSlice(weights.wv, l))
+        matmul[workers](state.v, state.xb, TensorSlice(weights.wv, l))
 
         # Apply RoPE rotation to the q and k vectors for each head
-        rope_rotation_llama(state, freq_cis_real_row, freq_cis_imag_row, config)
+        rope_rotation_llama[workers](
+            state, freq_cis_real_row, freq_cis_imag_row, config
+        )
 
         memset_zero(state.xb.data(), state.xb.num_elements())
 
         # Multihead attention. Iterate over all heads in parallel.
         @parameter
-        fn loop_over_heads(h:Int):
+        fn loop_over_heads(h: Int):
             # Get the query vector for this head
             let q_offset = h * head_size
 
@@ -729,18 +730,18 @@ fn transformer(
 
                 vectorize[nelts, xb_accumulate](head_size)
 
-        parallelize[loop_over_heads](config.n_heads,cores)
+        parallelize[loop_over_heads](config.n_heads, workers)
         # Final matrix multiplication to get the output of the attention
-        matmul(state.xb2, state.xb, TensorSlice(weights.wo, l))
+        matmul[workers](state.xb2, state.xb, TensorSlice(weights.wo, l))
         # Residual connection back into x
         accum(state.x, state.xb2)
         # FFN rmsnorm
         rmsnorm(state.xb, state.x, TensorSlice(weights.rms_ffn_weight, l))
 
         # Calculate self.w1(x) and self.w3(x) for FFN
-        matmul(state.hb, state.xb, TensorSlice(weights.w1, l))
+        matmul[workers](state.hb, state.xb, TensorSlice(weights.w1, l))
 
-        matmul(state.hb2, state.xb, TensorSlice(weights.w3, l))
+        matmul[workers](state.hb2, state.xb, TensorSlice(weights.w3, l))
 
         @parameter
         fn silu[_nelts: Int](i: Int):
@@ -752,7 +753,7 @@ fn transformer(
 
         vectorize[nelts, silu](hidden_dim)
         # Final matrix multiplication to get the output of the FFN
-        matmul(state.xb, state.hb, TensorSlice(weights.w2, l))
+        matmul[workers](state.xb, state.hb, TensorSlice(weights.w2, l))
 
         # Residual connection
         accum(state.x, state.xb)
@@ -761,7 +762,78 @@ fn transformer(
     rmsnorm(state.x, state.x, weights.rms_final_weight)
 
     # Classifier into logits
-    matmul(state.logits, state.x, weights.wcls)
+    matmul[workers](state.logits, state.x, weights.wcls)
+
+
+#alias transformer_fn_sig_type = fn[workers: Int](Int, Int, Config, inout RunState, TransformerWeights) raises -> None
+alias transformer_fn_sig_type = fn(token: Int, pos: Int, config: Config, inout state: RunState, weights: TransformerWeights) raises -> None
+fn transformer_evaluator(funcs: Pointer[transformer_fn_sig_type], size: Int) -> Int:
+    print("transformer evaluator number of candidates: ", size)
+    
+    let steps = 32
+    var tokenizer = StringRef("tokenizer.bin")
+    var checkpoint = StringRef("stories15M.bin")
+    var tbuf = FileBuf()
+    var fbuf = FileBuf()
+    try:
+        read_file(checkpoint, fbuf)
+        var config = Config()
+        config_init(config, fbuf)
+        
+        # negative vocab size is hacky way of signaling unshared weights. bit yikes.
+        let shared_weights = 1 if config.vocab_size > 0 else 0
+        config.vocab_size = (
+            -config.vocab_size if config.vocab_size < 0 else config.vocab_size
+        )
+
+        var weights: TransformerWeights = TransformerWeights(config, shared_weights, fbuf)
+
+        # Read in the tokenizer.bin file
+        read_file(tokenizer, tbuf)
+        var tok = Tokenizer(config.vocab_size, tbuf)
+        var state = RunState(config)
+        
+        var tokens = DynamicVector[Int](steps)
+        for ii in range(steps):
+            tokens[ii] = random_ui64(0, config.vocab_size).to_int()
+        
+        var best_idx: Int = -1
+        var best_time: Int = -1
+        for ii in range(size):
+            let func = funcs.load(ii)
+            @always_inline
+            @parameter
+            fn benchmark_loop():
+                try:
+                    #let start = time_in_ms()
+                    for pos in range(steps):
+                        _ = func(tokens[pos], pos, config, state, weights)
+                    #print(ii, "toks per sec", (steps) / (time_in_ms() - start) * 1000)
+                except:
+                    pass
+
+            let cur_time = Benchmark(1, 8, 500_000, 50_000_000_000).run[benchmark_loop]()
+            print("idx: ", ii, "tokens per second: ", (steps) / (cur_time / 1_000_000_000))
+            if best_time < 0 or cur_time < best_time:
+                best_time = cur_time
+                best_idx = ii
+        
+        
+        _ = (config, state, weights)
+        print("Best candidate idx:", best_idx)
+        return best_idx
+    except:
+        return -1
+
+fn transformer_autotune(token: Int, pos: Int, config: Config, inout state: RunState, weights: TransformerWeights) raises -> None:
+    alias best_impl: transformer_fn_sig_type
+    search[
+        transformer_fn_sig_type,
+        VariadicList(transformer.__adaptive_set),
+        transformer_evaluator -> best_impl
+    ]()
+    # Run the best candidate
+    return best_impl(token, pos, config, state, weights)
 
 
 fn argmax(v: TensorF32) -> Int:
@@ -870,9 +942,8 @@ fn print_usage():
 
 
 fn main() raises:
-    cores = num_cores()
     var tokenizer = StringRef("tokenizer.bin")
-    var checkpoint = StringRef("stories15M.bin")
+    var checkpoint = StringRef("stories110M.bin")
     var temperature = 0.9
     var steps = 256
     var prompt = String("")
@@ -895,8 +966,6 @@ fn main() raises:
                 rng_seed = atol(args[i + 1])
             if args[i] == "-i":
                 prompt = args[i + 1]
-            if args[i] == "-j":
-                cores = atol(args[i + 1])
             if args[i] == "-t":
                 let val = args[i + 1]
                 temperature = 0.0
@@ -917,7 +986,7 @@ fn main() raises:
         print_usage()
         return
 
-    print("num hardware threads:", cores, " SIMD width:", nelts)
+    print("num hardware threads:", num_cores(), " SIMD width:", nelts)
     random.seed(rng_seed)
     var fbuf: FileBuf = FileBuf()
     var tbuf: FileBuf = FileBuf()
@@ -942,8 +1011,17 @@ fn main() raises:
     var tok = Tokenizer(config.vocab_size, tbuf)
 
     # print the layers number and vocab size
-    print("checkpoint size: ", fbuf.size, "[", fbuf.size // 1024 // 1024, "MB ]", 
-        "| n layers:", config.n_layers, "| vocab size:", tok.vocab_size)
+    print(
+        "checkpoint size: ",
+        fbuf.size,
+        "[",
+        fbuf.size // 1024 // 1024,
+        "MB ]",
+        "| n layers:",
+        config.n_layers,
+        "| vocab size:",
+        tok.vocab_size,
+    )
 
     # Create and initialize the application RunState
     var state = RunState(config)
@@ -964,7 +1042,7 @@ fn main() raises:
     var pos = 0
     while pos < steps:
         # Forward the transformer to get logits for the next token
-        transformer(token, pos, config, state, weights)
+        transformer_autotune(token, pos, config, state, weights)
 
         if pos < len(prompt_tokens):
             next_token = prompt_tokens[pos]
