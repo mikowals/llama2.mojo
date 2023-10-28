@@ -1,5 +1,5 @@
 from algorithm import sum
-from algorithm import vectorize, parallelize
+from algorithm import vectorize, parallelize, unroll
 from builtin import string
 from math import round
 from memory import memset_zero, memcpy
@@ -19,7 +19,7 @@ import os
 import random
 import time
 
-alias nelts = (2 * simdwidthof[DType.float32]())
+alias nelts = (4 * simdwidthof[DType.float32]())
 
 alias PointerString = Pointer[UInt8]
 alias BufferPtrType = DTypePointer[DType.uint8]
@@ -322,7 +322,7 @@ struct RunState:
         # Initialize with placeholders. The real tensors reference layer and position during forward pass.
         self.k = create_weight[1](config.kv_dim)
         self.v = create_weight[1](config.kv_dim)
-        self.rt = Runtime(num_cores())
+        self.rt = Runtime(6)
 
 
 struct TransformerWeights:
@@ -504,6 +504,64 @@ fn softmax[
 
 
 @always_inline
+fn multiple_matmul[
+    n: Int
+](
+    C: StaticTuple[n, NDBuffer[1, DimList(), DType.float32]],
+    A: NDBuffer[1, DimList(), DType.float32],
+    B: StaticTuple[n, NDBuffer[2, DimList(), DType.float32]],
+    rt: Runtime,
+):
+    let rows = B[0].dim(0)
+    let cols = B[0].dim(1)
+
+    @parameter
+    fn compute_row(i: Int):
+        var tmp: StaticTuple[n, SIMD[DType.float32, nelts]]
+        if n == 2:
+            tmp = StaticTuple[n, SIMD[DType.float32, nelts]](
+                SIMD[DType.float32, nelts](0), SIMD[DType.float32, nelts](0)
+            )
+        elif n == 3:
+            tmp = StaticTuple[n, SIMD[DType.float32, nelts]](
+                SIMD[DType.float32, nelts](0),
+                SIMD[DType.float32, nelts](0),
+                SIMD[DType.float32, nelts](0),
+            )
+        else:
+            print("multiple_matmul not implemented for n > 3")
+
+        @parameter
+        fn dot[_nelts: Int](j: Int):
+            if _nelts < nelts:  # take care of tail array elements with length <  nelts
+                let a = A.simd_load[_nelts](j)
+
+                @parameter
+                fn _multiply_tail[k: Int]():
+                    tmp[k][0] += (a * B[k].simd_load[_nelts](i, j)).reduce_add()
+
+                unroll[n, _multiply_tail]()
+            else:
+                let a = A.simd_load[nelts](j)
+
+                @parameter
+                fn _multiply[k: Int]():
+                    tmp[k] += a * B[k].simd_load[nelts](i, j)
+
+                unroll[n, _multiply]()
+
+        vectorize[nelts, dot](cols)
+
+        @parameter
+        fn _reduce[k: Int]():
+            C[k][i] = tmp[k].reduce_add()
+
+        unroll[n, _reduce]()
+
+    parallelize[compute_row](rows, rt.parallelism_level())
+
+
+@always_inline
 fn matmul(
     C: NDBuffer[1, DimList(), DType.float32],
     A: NDBuffer[1, DimList(), DType.float32],
@@ -544,8 +602,7 @@ fn rope_rotation_llama(
     # stories model, llama2
     let head_size = config.head_size
 
-    @parameter
-    fn head_loop(i: Int):
+    for i in range(config.n_heads):
         # Simple vectorization with (head_size // 2) steps gave junk transformer output.
         # Maybe because the nelt ranges end up overlapping between the steps.
         for j in range(0, config.head_size, 2):
@@ -560,8 +617,6 @@ fn rope_rotation_llama(
                 let k1 = state.k[i * head_size + j + 1]
                 state.k[i * head_size + j] = k0 * fcr - k1 * fci
                 state.k[i * head_size + j + 1] = k0 * fci + k1 * fcr
-
-    parallelize[head_loop](config.n_heads, state.rt.parallelism_level())
 
 
 fn slice[
@@ -615,14 +670,21 @@ fn transformer(
         # Attention rmsnorm
         rmsnorm(state.xb, state.x, slice[2, 1](weights.rms_att_weight, l))
         # QKV matmuls for this position
-        matmul(state.q, state.xb, slice[3, 1](weights.wq, l), state.rt)
-
         let loff = l * config.seq_len * config.kv_dim
         state.k = slice[3, 2](state.key_cache, l, pos)
-        matmul(state.k, state.xb, slice[3, 1](weights.wk, l), state.rt)
-
         state.v = slice[3, 2](state.value_cache, l, pos)
-        matmul(state.v, state.xb, slice[3, 1](weights.wv, l), state.rt)
+        multiple_matmul[3](
+            StaticTuple[3, NDBuffer[1, DimList(), DType.float32]](
+                state.q, state.k, state.v
+            ),
+            state.xb,
+            StaticTuple[3, NDBuffer[2, DimList(), DType.float32]](
+                slice[3, 1](weights.wq, l),
+                slice[3, 1](weights.wk, l),
+                slice[3, 1](weights.wv, l),
+            ),
+            state.rt,
+        )
 
         # Apply RoPE rotation to the q and k vectors for each head
         rope_rotation_llama(state, freq_cis_real_row, freq_cis_imag_row, config)
@@ -688,9 +750,14 @@ fn transformer(
         rmsnorm(state.xb, state.x, slice[2, 1](weights.rms_ffn_weight, l))
 
         # Calculate self.w1(x) and self.w3(x) for FFN
-        matmul(state.hb, state.xb, slice[3, 1](weights.w1, l), state.rt)
-
-        matmul(state.hb2, state.xb, slice[3, 1](weights.w3, l), state.rt)
+        multiple_matmul[2](
+            StaticTuple[2, NDBuffer[1, DimList(), DType.float32]](state.hb, state.hb2),
+            state.xb,
+            StaticTuple[2, NDBuffer[2, DimList(), DType.float32]](
+                slice[3, 1](weights.w1, l), slice[3, 1](weights.w3, l)
+            ),
+            state.rt,
+        )
 
         @parameter
         fn silu[_nelts: Int](i: Int):
