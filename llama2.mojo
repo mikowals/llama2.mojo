@@ -540,37 +540,58 @@ fn softmax(x: BufferPtrFloat32, start: Int, end: Int):
 
 
 @always_inline
-fn matmul_parallelized(
-    C: BufferPtrFloat32,
-    A: BufferPtrFloat32,
-    B: BufferPtrFloat32,
-    rows: Int,
-    cols: Int,
-):
+fn batch_matmul[
+    n: Int
+](C: StaticTuple[n, Weight[1]], A: Weight[1], B: StaticTuple[n, Weight[2]],):
+    let rows = B[0].dim(0)
+    let cols = B[0].dim(1)
+
     @parameter
-    fn compute_row(i: Int):
-        var tmp = SIMD[DType.float32, nelts](0)
+    fn calc_rows(i: Int):
+        var tmp: StaticTuple[n, SIMD[DType.float32, nelts]]
+
+        @parameter
+        fn _init[k: Int]():
+            tmp[k] = SIMD[DType.float32, nelts](0)
+
+        unroll[n, _init]()
+
+        let row_offset = i * cols
 
         @parameter
         fn dot[_nelts: Int](j: Int):
-            if _nelts < nelts:  # take care of tail array elements with length <  nelts
-                tmp[0] += (
-                    A.simd_load[_nelts](j) * B.simd_load[_nelts](i * cols + j)
-                ).reduce_add()
-            else:
-                tmp += A.simd_load[nelts](j) * B.simd_load[nelts](i * cols + j)
+            @parameter
+            fn _multiply[k: Int]():
+                if (
+                    _nelts < nelts
+                ):  # take care of tail array elements with length <  nelts
+                    tmp[k][0] += (
+                        A.simd_load[_nelts](j) * B[k].simd_load[_nelts](row_offset + j)
+                    ).reduce_add()
+
+                else:
+                    tmp[k] += A.simd_load[nelts](j) * B[k].simd_load[nelts](
+                        row_offset + j
+                    )
+
+            unroll[n, _multiply]()
 
         vectorize[nelts, dot](cols)
-        C.store(i, tmp.reduce_add())
 
-    parallelize[compute_row](rows, workers)
+        @parameter
+        fn _reduce[k: Int]():
+            C[k].simd_store[1](i, tmp[k].reduce_add())
+
+        unroll[n, _reduce]()
+
+    parallelize[calc_rows](rows, workers)
 
 
 @always_inline
 fn matmul(C: Weight[1], A: Weight[1], B: Weight[2]) raises:
     # B (d,n) @ A (n,) -> C (d,)
     # matmul_dimension_checks(A._shape, B._shape)
-    matmul_parallelized(C.data(), A.data(), B.data(), B.dim(0), B.dim(1))
+    batch_matmul[1](StaticTuple[1, Weight[1]](C), A, StaticTuple[1, Weight[2]](B))
 
 
 # Apply RoPE rotation to the q and k vectors for each head
@@ -633,10 +654,23 @@ fn transformer(
         # QKV matmuls for this position
         var k = state.key_cache[l * config.seq_len + pos]
         var v = state.value_cache[l * config.seq_len + pos]
-        matmul(state.q, state.xb, weights.wq[l])
-        matmul(k, state.xb, weights.wk[l])
-        matmul(v, state.xb, weights.wv[l])
-
+        # Fuse the loops for calculating q, k, v.  Equivalent to:
+        # matmul(state.q, state.xb, weights.wq[l])
+        # matmul(k, state.xb, weights.wk[l])
+        # matmul(v, state.xb, weights.wv[l])
+        if kv_dim == dim:
+            batch_matmul[3](
+                StaticTuple[3, Weight[1]](state.q, k, v),
+                state.xb,
+                StaticTuple[3, Weight[2]](weights.wq[l], weights.wk[l], weights.wv[l]),
+            )
+        else:
+            matmul(state.q, state.xb, weights.wq[l])
+            batch_matmul[2](
+                StaticTuple[2, Weight[1]](k, v),
+                state.xb,
+                StaticTuple[2, Weight[2]](weights.wk[l], weights.wv[l]),
+            )
         # Apply RoPE rotation to the q and k vectors for each head
         rope_rotation_llama(
             state.q,
@@ -707,9 +741,14 @@ fn transformer(
         rmsnorm(state.xb, state.x, weights.rms_ffn_weight[l])
 
         # Calculate self.w1(x) and self.w3(x) for FFN
-        matmul(state.hb, state.xb, weights.w1[l])
-
-        matmul(state.hb2, state.xb, weights.w3[l])
+        # Fuse the loops for hb and hb2.  Equivalent to:
+        # matmul(state.hb, state.xb, weights.w1[l])
+        # matmul(state.hb2, state.xb, weights.w3[l])
+        batch_matmul[2](
+            StaticTuple[2, Weight[1]](state.hb, state.hb2),
+            state.xb,
+            StaticTuple[2, Weight[2]](weights.w1[l], weights.w3[l]),
+        )
 
         @parameter
         fn silu[_nelts: Int](i: Int):
