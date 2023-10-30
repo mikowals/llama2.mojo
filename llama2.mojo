@@ -19,7 +19,8 @@ import os
 import random
 import time
 
-alias nelts = (2 * simdwidthof[DType.float32]())
+var workers = 0
+alias nelts = (4 * simdwidthof[DType.float32]())
 
 alias PointerString = Pointer[UInt8]
 alias BufferPtrType = DTypePointer[DType.uint8]
@@ -327,9 +328,8 @@ struct RunState:
     var v: Weight[1]  # value (kv_dim,)
     var att: Weight[2]  # buffer for scores/attention values (n_heads, seq_len)
     var logits: Weight[1]  # output logits
-    var key_cache: Weight[3]  # (layer, seq_len, dim)
-    var value_cache: Weight[3]  # (layer, seq_len, dim)
-    var rt: Runtime
+    var key_cache: DynamicVector[Weight[1]]  # (layer, seq_len, dim)
+    var value_cache: DynamicVector[Weight[1]]  # (layer, seq_len, dim)
 
     @always_inline
     fn __init__(inout self, config: Config) raises:
@@ -341,17 +341,20 @@ struct RunState:
         self.q = Weight[1](StaticIntTuple[1](config.dim))
         self.att = Weight[2](StaticIntTuple[2](config.n_heads, config.seq_len))
         self.logits = Weight[1](config.vocab_size)
-        self.key_cache = Weight[3](
-            StaticIntTuple[3](config.n_layers, config.seq_len, config.kv_dim)
-        )
-        self.value_cache = Weight[3](
-            StaticIntTuple[3](config.n_layers, config.seq_len, config.kv_dim)
-        )
+        self.key_cache = DynamicVector[Weight[1]](config.n_layers * config.seq_len)
+        self.value_cache = DynamicVector[Weight[1]](config.n_layers * config.seq_len)
+        for l in range(config.n_layers):
+            for t in range(config.seq_len):
+                self.key_cache[l * config.seq_len + t] = Weight[1](
+                    StaticIntTuple[1](config.kv_dim)
+                )
+                self.value_cache[l * config.seq_len + t] = Weight[1](
+                    StaticIntTuple[1](config.kv_dim)
+                )
         # So their updates flow to the caches, k and v are slices with shared memory.
         # Initialize with placeholders. The real tensors reference layer and position during forward pass.
         self.k = Weight[1](StaticIntTuple[1](config.kv_dim))
         self.v = Weight[1](StaticIntTuple[1](config.kv_dim))
-        self.rt = Runtime(num_cores())
 
 
 struct TransformerWeights:
@@ -543,7 +546,6 @@ fn matmul_parallelized(
     B: BufferPtrFloat32,
     rows: Int,
     cols: Int,
-    rt: Runtime,
 ):
     @parameter
     fn compute_row(i: Int):
@@ -561,21 +563,22 @@ fn matmul_parallelized(
         vectorize[nelts, dot](cols)
         C.store(i, tmp.reduce_add())
 
-    parallelize[compute_row](rows, rt.parallelism_level())
+    parallelize[compute_row](rows, workers)
 
 
 @always_inline
-fn matmul(C: Weight[1], A: Weight[1], B: Weight[2], rt: Runtime) raises:
+fn matmul(C: Weight[1], A: Weight[1], B: Weight[2]) raises:
     # B (d,n) @ A (n,) -> C (d,)
     # matmul_dimension_checks(A._shape, B._shape)
-    matmul_parallelized(C.data(), A.data(), B.data(), B.dim(0), B.dim(1), rt)
+    matmul_parallelized(C.data(), A.data(), B.data(), B.dim(0), B.dim(1))
 
 
 # Apply RoPE rotation to the q and k vectors for each head
 # rotate odd and even dim
 @always_inline
 fn rope_rotation_llama(
-    inout state: RunState,
+    inout q: Weight[1],
+    inout k: Weight[1],
     freq_cis_real_row: Weight[1],
     freq_cis_imag_row: Weight[1],
     config: Config,
@@ -583,24 +586,21 @@ fn rope_rotation_llama(
     # stories model, llama2
     let head_size = config.head_size
 
-    @parameter
-    fn head_loop(i: Int):
+    for i in range(config.n_heads):
         # Simple vectorization with (head_size // 2) steps gave junk transformer output.
         # Maybe because the nelt ranges end up overlapping between the steps.
         for j in range(0, config.head_size, 2):
             let fcr = freq_cis_real_row[j // 2]
             let fci = freq_cis_imag_row[j // 2]
-            let q0 = state.q[i * head_size + j]
-            let q1 = state.q[i * head_size + j + 1]
-            state.q[i * head_size + j] = q0 * fcr - q1 * fci
-            state.q[i * head_size + j + 1] = q0 * fci + q1 * fcr
+            let q0 = q[i * head_size + j]
+            let q1 = q[i * head_size + j + 1]
+            q[i * head_size + j] = q0 * fcr - q1 * fci
+            q[i * head_size + j + 1] = q0 * fci + q1 * fcr
             if i < config.n_kv_heads:
-                let k0 = state.k[i * head_size + j]
-                let k1 = state.k[i * head_size + j + 1]
-                state.k[i * head_size + j] = k0 * fcr - k1 * fci
-                state.k[i * head_size + j + 1] = k0 * fci + k1 * fcr
-
-    parallelize[head_loop](config.n_heads, state.rt.parallelism_level())
+                let k0 = k[i * head_size + j]
+                let k1 = k[i * head_size + j + 1]
+                k[i * head_size + j] = k0 * fcr - k1 * fci
+                k[i * head_size + j + 1] = k0 * fci + k1 * fcr
 
 
 @always_inline
@@ -631,23 +631,20 @@ fn transformer(
         # Attention rmsnorm
         rmsnorm(state.xb, state.x, weights.rms_att_weight[l])
         # QKV matmuls for this position
-        matmul(state.q, state.xb, weights.wq[l], state.rt)
-
-        let loff = l * config.seq_len * config.kv_dim
-        state.k = Weight[1](
-            state.key_cache.data().offset(loff + pos * config.kv_dim),
-            StaticIntTuple[1](config.kv_dim),
-        )
-        matmul(state.k, state.xb, weights.wk[l], state.rt)
-
-        state.v = Weight[1](
-            state.value_cache.data().offset(loff + pos * config.kv_dim),
-            StaticIntTuple[1](config.kv_dim),
-        )
-        matmul(state.v, state.xb, weights.wv[l], state.rt)
+        var k = state.key_cache[l * config.seq_len + pos]
+        var v = state.value_cache[l * config.seq_len + pos]
+        matmul(state.q, state.xb, weights.wq[l])
+        matmul(k, state.xb, weights.wk[l])
+        matmul(v, state.xb, weights.wv[l])
 
         # Apply RoPE rotation to the q and k vectors for each head
-        rope_rotation_llama(state, freq_cis_real_row, freq_cis_imag_row, config)
+        rope_rotation_llama(
+            state.q,
+            k,
+            freq_cis_real_row,
+            freq_cis_imag_row,
+            config,
+        )
 
         memset_zero(state.xb.data(), state.xb.num_elements())
 
@@ -659,11 +656,11 @@ fn transformer(
 
             # Index of attention scores for this head
             let att_offset = h * config.seq_len
-
+            let kv_offset = (h // kv_mul) * head_size
             # Iterate over all timesteps, including the current one
             for t in range(pos + 1):
                 # Starting index of the key vector for this head and at this timestep
-                let k_offset = loff + t * kv_dim + (h // kv_mul) * head_size
+                let k = state.key_cache[l * config.seq_len + t]
                 # Calculate the attention score as the dot product of q and k
                 var score: Float32 = 0.0
 
@@ -671,7 +668,7 @@ fn transformer(
                 fn score_fn[_nelts: Int](i: Int):
                     score += (
                         state.q.simd_load[_nelts](q_offset + i)
-                        * state.key_cache.simd_load[_nelts](k_offset + i)
+                        * k.simd_load[_nelts](kv_offset + i)
                     ).reduce_add()
 
                 vectorize[nelts, score_fn](head_size)
@@ -686,7 +683,7 @@ fn transformer(
             let xb_offset = h * head_size
             for t in range(pos + 1):
                 # Starting index of the value vector for this head and at this timestep
-                let v_offset = loff + t * kv_dim + (h // kv_mul) * head_size
+                let v = state.value_cache[l * config.seq_len + t]
 
                 # Get the attention weight for this timestep
                 let a = state.att[att_offset + t]
@@ -696,23 +693,23 @@ fn transformer(
                 fn xb_accumulate[_nelts: Int](i: Int):
                     let xbi = state.xb.simd_load[_nelts](
                         xb_offset + i
-                    ) + a * state.value_cache.simd_load[_nelts](v_offset + i)
+                    ) + a * v.simd_load[_nelts](kv_offset + i)
                     state.xb.simd_store[_nelts](xb_offset + i, xbi)
 
                 vectorize[nelts, xb_accumulate](head_size)
 
-        parallelize[loop_over_heads](config.n_heads, state.rt.parallelism_level())
+        parallelize[loop_over_heads](config.n_heads, workers)
         # Final matrix multiplication to get the output of the attention
-        matmul(state.xb2, state.xb, weights.wo[l], state.rt)
+        matmul(state.xb2, state.xb, weights.wo[l])
         # Residual connection back into x
         accum(state.x, state.xb2)
         # FFN rmsnorm
         rmsnorm(state.xb, state.x, weights.rms_ffn_weight[l])
 
         # Calculate self.w1(x) and self.w3(x) for FFN
-        matmul(state.hb, state.xb, weights.w1[l], state.rt)
+        matmul(state.hb, state.xb, weights.w1[l])
 
-        matmul(state.hb2, state.xb, weights.w3[l], state.rt)
+        matmul(state.hb2, state.xb, weights.w3[l])
 
         @parameter
         fn silu[_nelts: Int](i: Int):
@@ -724,7 +721,7 @@ fn transformer(
 
         vectorize[nelts, silu](hidden_dim)
         # Final matrix multiplication to get the output of the FFN
-        matmul(state.xb, state.hb, weights.w2[l], state.rt)
+        matmul(state.xb, state.hb, weights.w2[l])
 
         # Residual connection
         accum(state.x, state.xb)
@@ -733,7 +730,7 @@ fn transformer(
     rmsnorm(state.x, state.x, weights.rms_final_weight)
 
     # Classifier into logits
-    matmul(state.logits, state.x, weights.wcls, state.rt)
+    matmul(state.logits, state.x, weights.wcls)
 
 
 @always_inline
@@ -849,6 +846,7 @@ fn print_usage():
 
 @always_inline
 fn main() raises:
+    workers = num_cores()
     print("num hardware threads: ", num_cores())
     print("SIMD vector width: ", nelts)
     var tokenizer = StringRef("tokenizer.bin")
@@ -867,6 +865,8 @@ fn main() raises:
         for i in range(2, len(args), 2):
             if args[i] == "-p":
                 print("Option not supported: ", args[i])
+            if args[i] == "-j":
+                workers = atol(args[i + 1])
             if args[i] == "-n":
                 steps = atol(args[i + 1])
             if args[i] == "-z":
