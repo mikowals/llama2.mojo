@@ -194,6 +194,9 @@ struct FileBuf:
         self.offset = 0
         self.size = 0
 
+    fn __del__(owned self):
+        self.data.free()
+
     @always_inline
     fn move_offset(inout self, size: Int) raises:
         let new_offset = self.offset + size
@@ -255,6 +258,11 @@ struct Tokenizer:
             self.vocab.store(i, read_val_str(buf, slen))
 
         return None
+
+    fn __del__(owned self):
+        self.vocab.free()
+        self.vocab_scores.free()
+        self.sorted_vocab.free()
 
     # sort vocab by string_compare
     @always_inline
@@ -1016,4 +1024,8 @@ fn main() raises:
             start = time_in_ms()
 
     let end = time_in_ms()
+    # Make it explicit that fbuf exists and owns the pointet to all weights.
+    # Removing this line means the weights pointers are freed immediately
+    # after TransformerWeights is initialized.
+    _ = (fbuf,)
     print("\nachieved tok/s: ", (pos - 1) / (end - start) * 1000)
