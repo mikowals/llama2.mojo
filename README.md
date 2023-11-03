@@ -7,6 +7,7 @@
 ## why this port?
 
 This repository serves as a port that provides a Mojo-based implementation of `llama2.c`.
+supported version: [Mojo 0.5.0](https://docs.modular.com/mojo/changelog.html#v0.5.0-2023-11-2)
 
 With the release of [Mojo](https://www.modular.com/blog/mojo-its-finally-here), I was inspired to take my Python port
 of [llama2.py](https://github.com/tairov/llama2.py) and transition it to Mojo. The result? A version that leverages
@@ -30,7 +31,7 @@ far.
 At the moment, the following models were successfully executed via `llama2.mojo`:
 
 | Model                    |
-|--------------------------|
+| ------------------------ |
 | stories 260K, 15M, 110M  |
 | Tinyllama-1.1B-Chat-v0.2 |
 
@@ -46,10 +47,10 @@ CPU MHz:    3191.998
 ```
 
 | Model           | [llama2.py](https://github.com/tairov/llama2.py) | [llama2.c](https://github.com/karpathy/llama2.c) | [llama2.c](https://github.com/karpathy/llama2.c) (runfast) | [llama2.c](https://github.com/karpathy/llama2.c) (OMP/parallelized) | **llama2.mojo** | **llama2.mojo** (parallelized) | llama2.mojo (naive matmul) |
-|-----------------|--------------------------------------------------|--------------------------------------------------|------------------------------------------------------------|---------------------------------------------------------------------|-----------------|--------------------------------|----------------------------|
-| stories15M.bin  | 1.3 tok/s                                        | 75.73 tok/s                                      | 237 tok/s                                                  | 450 tok/s                                                           | 260 tok/s       | 390 tok/s                      | 67.26 tok/s                | 
-| stories110M.bin | -                                                | 9 tok/s                                          | 30 tok/s                                                   | 64 tok/s                                                            | 40 tok/s        | 57 tok/s                       | 9.20 tok/s                 | 
-| TinyLlama-1.1B  | -                                                | -                                                | 2.4 tok/s                                                  | 7.25 tok/s                                                          | -               | 6.6 tok/s                      | -                          | 
+| --------------- | ------------------------------------------------ | ------------------------------------------------ | ---------------------------------------------------------- | ------------------------------------------------------------------- | --------------- | ------------------------------ | -------------------------- |
+| stories15M.bin  | 1.3 tok/s                                        | 75.73 tok/s                                      | 237 tok/s                                                  | 450 tok/s                                                           | 260 tok/s       | 390 tok/s                      | 67.26 tok/s                |
+| stories110M.bin | -                                                | 9 tok/s                                          | 30 tok/s                                                   | 64 tok/s                                                            | 40 tok/s        | 57 tok/s                       | 9.20 tok/s                 |
+| TinyLlama-1.1B  | -                                                | -                                                | 2.4 tok/s                                                  | 7.25 tok/s                                                          | -               | 6.6 tok/s                      | -                          |
 
 ## prerequisites
 
@@ -115,7 +116,7 @@ With Gradio UI:
 ```bash
 # uncomment the last line in Dockerfile CMD ["python", "gradio_app.py"]
 docker run -it -p 0.0.0.0:7860:7860 llama2.mojo
-``` 
+```
 
 ## citing llama2.🔥
 
@@ -123,7 +124,7 @@ If you use or discuss llama2.mojo in your academic research, please cite the pro
 
 ```
 @misc{llama2.mojo,
-  author = {Aydyn Tairov}, 
+  author = {Aydyn Tairov},
   title = {Inference Llama2 in one file of pure Mojo},
   year = {2023},
   month = {09},
