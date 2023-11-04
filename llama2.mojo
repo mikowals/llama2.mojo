@@ -332,8 +332,6 @@ struct RunState:
     var hb: Weight[1]  # buffer for hidden dimension in the ffn (hidden_dim,)
     var hb2: Weight[1]  # buffer for hidden dimension in the ffn (hidden_dim,)
     var q: Weight[1]  # query (dim,)
-    var k: Weight[1]  # key (kv_dim,)
-    var v: Weight[1]  # value (kv_dim,)
     var att: Weight[2]  # buffer for scores/attention values (n_heads, seq_len)
     var logits: Weight[1]  # output logits
     var key_cache: DynamicVector[Weight[1]]  # (layer, seq_len, dim)
@@ -359,10 +357,19 @@ struct RunState:
                 self.value_cache[l * config.seq_len + t] = Weight[1](
                     StaticIntTuple[1](config.kv_dim)
                 )
-        # So their updates flow to the caches, k and v are slices with shared memory.
-        # Initialize with placeholders. The real tensors reference layer and position during forward pass.
-        self.k = Weight[1](StaticIntTuple[1](config.kv_dim))
-        self.v = Weight[1](StaticIntTuple[1](config.kv_dim))
+
+    fn __del__(owned self):
+        self.x._data.free()
+        self.xb._data.free()
+        self.xb2._data.free()
+        self.hb._data.free()
+        self.hb2._data.free()
+        self.q._data.free()
+        self.att._data.free()
+        self.logits._data.free()
+        for ii in range(len(self.key_cache)):
+            self.key_cache[ii]._data.free()
+            self.value_cache[ii]._data.free()
 
 
 struct TransformerWeights:
