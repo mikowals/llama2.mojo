@@ -17,6 +17,7 @@ import os
 import random
 import time
 
+var workers = 0
 alias nelts = (4 * simdwidthof[DType.float32]())
 
 alias PointerString = Pointer[UInt8]
@@ -286,7 +287,6 @@ struct RunState:
     var logits: NDBuffer[1, DimList(), DType.float32]  # output logits
     var key_cache: NDBuffer[3, DimList(), DType.float32]  # (layer, seq_len, dim)
     var value_cache: NDBuffer[3, DimList(), DType.float32]  # (layer, seq_len, dim)
-    var rt: Runtime
 
     @always_inline
     fn __init__(
@@ -320,7 +320,6 @@ struct RunState:
         # Initialize with placeholders. The real tensors reference layer and position during forward pass.
         self.k = create_weight[1](config.kv_dim)
         self.v = create_weight[1](config.kv_dim)
-        self.rt = Runtime(6)
 
 
 struct TransformerWeights:
@@ -386,10 +385,10 @@ fn read_file(file_name: String, inout buf: FileBuf) raises:
     let cp_buf: BufferPtrType = BufferPtrType.alloc(cp_size)
 
     let data_ptr = data._as_ptr().bitcast[DType.uint8]()
-    
+
     for i in range(cp_size):
-        cp_buf.store(i,data_ptr.load(i))
-    
+        cp_buf.store(i, data_ptr.load(i))
+
     # don't free data
     _ = data
 
@@ -508,7 +507,6 @@ fn multiple_matmul[
     C: StaticTuple[n, NDBuffer[1, DimList(), DType.float32]],
     A: NDBuffer[1, DimList(), DType.float32],
     B: StaticTuple[n, NDBuffer[2, DimList(), DType.float32]],
-    rt: Runtime,
 ):
     let rows = B[0].dim(0)
     let cols = B[0].dim(1)
@@ -516,18 +514,12 @@ fn multiple_matmul[
     @parameter
     fn compute_row(i: Int):
         var tmp: StaticTuple[n, SIMD[DType.float32, nelts]]
-        if n == 2:
-            tmp = StaticTuple[n, SIMD[DType.float32, nelts]](
-                SIMD[DType.float32, nelts](0), SIMD[DType.float32, nelts](0)
-            )
-        elif n == 3:
-            tmp = StaticTuple[n, SIMD[DType.float32, nelts]](
-                SIMD[DType.float32, nelts](0),
-                SIMD[DType.float32, nelts](0),
-                SIMD[DType.float32, nelts](0),
-            )
-        else:
-            print("multiple_matmul not implemented for n > 3")
+
+        @parameter
+        fn _init[k: Int]():
+            tmp[k] = SIMD[DType.float32, nelts](0)
+
+        unroll[n, _init]()
 
         @parameter
         fn dot[_nelts: Int](j: Int):
@@ -556,7 +548,7 @@ fn multiple_matmul[
 
         unroll[n, _reduce]()
 
-    parallelize[compute_row](rows, rt.parallelism_level())
+    parallelize[compute_row](rows, workers)
 
 
 @always_inline
@@ -564,28 +556,12 @@ fn matmul(
     C: NDBuffer[1, DimList(), DType.float32],
     A: NDBuffer[1, DimList(), DType.float32],
     B: NDBuffer[2, DimList(), DType.float32],
-    rt: Runtime,
 ):
-    let rows = B.dim(0)
-    let cols = B.dim(1)
-
-    @parameter
-    fn compute_row(i: Int):
-        var tmp = SIMD[DType.float32, nelts](0)
-
-        @parameter
-        fn dot[_nelts: Int](j: Int):
-            if _nelts < nelts:  # take care of tail array elements with length <  nelts
-                tmp[0] += (
-                    A.simd_load[_nelts](j) * B.simd_load[_nelts](i, j)
-                ).reduce_add()
-            else:
-                tmp += A.simd_load[nelts](j) * B.simd_load[nelts](i, j)
-
-        vectorize[nelts, dot](cols)
-        C[i] = tmp.reduce_add()
-
-    parallelize[compute_row](rows, rt.parallelism_level())
+    multiple_matmul[1](
+        StaticTuple[1, NDBuffer[1, DimList(), DType.float32]](C),
+        A,
+        StaticTuple[1, NDBuffer[2, DimList(), DType.float32]](B),
+    )
 
 
 # Apply RoPE rotation to the q and k vectors for each head
@@ -681,7 +657,6 @@ fn transformer(
                 slice[3, 1](weights.wk, l),
                 slice[3, 1](weights.wv, l),
             ),
-            state.rt,
         )
 
         # Apply RoPE rotation to the q and k vectors for each head
@@ -739,9 +714,9 @@ fn transformer(
 
                 vectorize[nelts, xb_accumulate](head_size)
 
-        parallelize[loop_over_heads](config.n_heads, state.rt.parallelism_level())
+        parallelize[loop_over_heads](config.n_heads, workers)
         # Final matrix multiplication to get the output of the attention
-        matmul(state.xb2, state.xb, slice[3, 1](weights.wo, l), state.rt)
+        matmul(state.xb2, state.xb, slice[3, 1](weights.wo, l))
         # Residual connection back into x
         accum(state.x, state.xb2)
         # FFN rmsnorm
@@ -754,7 +729,6 @@ fn transformer(
             StaticTuple[2, NDBuffer[2, DimList(), DType.float32]](
                 slice[3, 1](weights.w1, l), slice[3, 1](weights.w3, l)
             ),
-            state.rt,
         )
 
         @parameter
@@ -769,7 +743,7 @@ fn transformer(
 
         vectorize[nelts, silu](hidden_dim)
         # Final matrix multiplication to get the output of the FFN
-        matmul(state.xb, state.hb, slice[3, 1](weights.w2, l), state.rt)
+        matmul(state.xb, state.hb, slice[3, 1](weights.w2, l))
 
         # Residual connection
         accum(state.x, state.xb)
@@ -778,7 +752,7 @@ fn transformer(
     rmsnorm(state.x, state.x, weights.rms_final_weight)
 
     # Classifier into logits
-    matmul(state.logits, state.x, weights.wcls, state.rt)
+    matmul(state.logits, state.x, weights.wcls)
 
 
 @always_inline
@@ -894,6 +868,7 @@ fn print_usage():
 
 @always_inline
 fn main() raises:
+    workers = num_cores()
     print("num hardware threads: ", num_cores())
     print("SIMD vector width: ", nelts)
     var tokenizer = StringRef("tokenizer.bin")
@@ -912,6 +887,8 @@ fn main() raises:
         for i in range(2, len(args), 2):
             if args[i] == "-p":
                 print("Option not supported: ", args[i])
+            if args[i] == "-j":
+                workers = atol(args[i + 1])
             if args[i] == "-n":
                 steps = atol(args[i + 1])
             if args[i] == "-z":
