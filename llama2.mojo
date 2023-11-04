@@ -258,6 +258,8 @@ struct Tokenizer:
         return None
 
     fn __del__(owned self):
+        for ii in range(self.vocab_size):
+            self.vocab[ii].free()
         self.vocab.free()
         self.vocab_scores.free()
         self.sorted_vocab.free()
@@ -437,10 +439,10 @@ fn read_file(file_name: String, inout buf: FileBuf) raises:
     let cp_buf: BufferPtrType = BufferPtrType.alloc(cp_size)
 
     let data_ptr = data._as_ptr().bitcast[DType.uint8]()
-    
+
     for i in range(cp_size):
-        cp_buf.store(i,data_ptr.load(i))
-    
+        cp_buf.store(i, data_ptr.load(i))
+
     # don't free data
     _ = data
 
@@ -554,13 +556,7 @@ fn batch_matmul[
 
     @parameter
     fn calc_rows(i: Int):
-        var tmp: StaticTuple[n, SIMD[DType.float32, nelts]]
-
-        @parameter
-        fn _init[k: Int]():
-            tmp[k] = SIMD[DType.float32, nelts](0)
-
-        unroll[n, _init]()
+        var tmp = StaticTuple[n, SIMD[DType.float32, nelts]](0, 0, 0)
 
         let row_offset = i * cols
 
