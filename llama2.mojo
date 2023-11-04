@@ -9,6 +9,7 @@ from random import rand
 from runtime.llcl import num_cores
 from sys import argv
 from testing import assert_equal, assert_true
+from utils.index import product
 
 # The SIMD vector width.
 from sys.info import simdwidthof
@@ -34,19 +35,8 @@ struct Weight[rank: Int]:
     fn __init__(data: BufferPtrFloat32, shape: StaticIntTuple[rank]) -> Self:
         return Self {_data: data, _shape: shape}
 
-    fn __init__(shape: StaticIntTuple[rank]) -> Self:
-        var num_elements = 1
-        for ii in range(rank):
-            num_elements *= shape[ii]
-
-        let data = BufferPtrFloat32.alloc(num_elements)
-        return Self {_data: data, _shape: shape}
-
     fn num_elements(self) -> Int:
-        var num_elements = 1
-        for ii in range(rank):
-            num_elements *= self._shape[ii]
-        return num_elements
+        return product[rank](self._shape, rank)
 
     @always_inline
     fn __getitem__(self, index: Int) -> SIMD[DType.float32, 1]:
@@ -71,6 +61,13 @@ struct Weight[rank: Int]:
     @always_inline
     fn data(self) -> BufferPtrFloat32:
         return self._data
+
+    @staticmethod
+    fn alloc(*dims: Int) -> Self:
+        let shape = StaticIntTuple[rank](dims)
+        let num_elements = product[rank](shape, rank)
+        let data = BufferPtrFloat32.alloc(num_elements)
+        return Self {_data: data, _shape: shape}
 
 
 fn read_val_int(inout buf: FileBuf) raises -> Int:
@@ -339,23 +336,21 @@ struct RunState:
 
     @always_inline
     fn __init__(inout self, config: Config) raises:
-        self.x = Weight[1](StaticIntTuple[1](config.dim))
-        self.xb = Weight[1](StaticIntTuple[1](config.dim))
-        self.xb2 = Weight[1](StaticIntTuple[1](config.dim))
-        self.hb = Weight[1](StaticIntTuple[1](config.hidden_dim))
-        self.hb2 = Weight[1](StaticIntTuple[1](config.hidden_dim))
-        self.q = Weight[1](StaticIntTuple[1](config.dim))
-        self.att = Weight[2](StaticIntTuple[2](config.n_heads, config.seq_len))
-        self.logits = Weight[1](config.vocab_size)
+        self.x = Weight[1].alloc(config.dim)
+        self.xb = Weight[1].alloc(config.dim)
+        self.xb2 = Weight[1].alloc(config.dim)
+        self.hb = Weight[1].alloc(config.hidden_dim)
+        self.hb2 = Weight[1].alloc(config.hidden_dim)
+        self.q = Weight[1].alloc(config.dim)
+        self.att = Weight[2].alloc(config.n_heads, config.seq_len)
+        self.logits = Weight[1].alloc(config.vocab_size)
         self.key_cache = DynamicVector[Weight[1]](config.n_layers * config.seq_len)
         self.value_cache = DynamicVector[Weight[1]](config.n_layers * config.seq_len)
         for l in range(config.n_layers):
             for t in range(config.seq_len):
-                self.key_cache[l * config.seq_len + t] = Weight[1](
-                    StaticIntTuple[1](config.kv_dim)
-                )
-                self.value_cache[l * config.seq_len + t] = Weight[1](
-                    StaticIntTuple[1](config.kv_dim)
+                self.key_cache[l * config.seq_len + t] = Weight[1].alloc(config.kv_dim)
+                self.value_cache[l * config.seq_len + t] = Weight[1].alloc(
+                    config.kv_dim
                 )
 
     fn __del__(owned self):
@@ -399,9 +394,7 @@ struct TransformerWeights:
         ]:
             let shape = StaticIntTuple[rank](dims)
             var v = DynamicVector[Weight[rank]](layers)
-            var num_elements = 1
-            for ii in range(rank):
-                num_elements *= shape[ii]
+            let num_elements = product[rank](shape, rank)
             for ii in range(layers):
                 v[ii] = Weight[rank](buf.bitcast_offset_f32(num_elements), shape)
 
@@ -571,13 +564,11 @@ fn batch_matmul[
         fn dot[_nelts: Int](j: Int):
             @parameter
             fn _multiply[k: Int]():
-                if (
-                    _nelts < nelts
-                ):  # take care of tail array elements with length <  nelts
+                # take care of tail array elements with length <  nelts
+                if _nelts < nelts:
                     tmp[k][0] += (
                         A.simd_load[_nelts](j) * B[k].simd_load[_nelts](row_offset + j)
                     ).reduce_add()
-
                 else:
                     tmp[k] += A.simd_load[nelts](j) * B[k].simd_load[nelts](
                         row_offset + j
