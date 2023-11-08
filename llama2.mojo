@@ -1,5 +1,5 @@
 from algorithm import sum
-from algorithm import vectorize, parallelize, unroll
+from algorithm import parallelize, unroll, tile
 from builtin import string
 from math import round
 from memory import memset_zero, memcpy
@@ -19,7 +19,8 @@ import time
 
 var workers = 0
 
-alias nelts = (4*simdwidthof[DType.float32]())
+alias nelts = (8 * simdwidthof[DType.float32]())
+alias nelts_alternatives = VariadicList[Int](nelts, 16, 8, 4, 2, 1)
 
 alias PointerString = Pointer[UInt8]
 alias BufferPtrType = DTypePointer[DType.uint8]
@@ -371,7 +372,6 @@ struct RunState:
     var key_cache: TensorF32  # (layer, seq_len, dim)
     var value_cache: TensorF32  # (layer, seq_len, dim)
 
-
     fn __init__(inout self, config: Config) raises:
         self.x = TensorF32(config.dim)
         self.xb = TensorF32(config.dim)
@@ -449,10 +449,10 @@ fn read_file(file_name: String, inout buf: FileBuf) raises:
     let cp_buf: BufferPtrType = BufferPtrType.alloc(cp_size)
 
     let data_ptr = data._as_ptr().bitcast[DType.uint8]()
-    
+
     for i in range(cp_size):
-        cp_buf.store(i,data_ptr.load(i))
-    
+        cp_buf.store(i, data_ptr.load(i))
+
     # don't free data
     _ = data
 
@@ -484,7 +484,7 @@ fn accum(inout a: TensorF32, b: TensorF32) -> None:
     fn _acc[_nelts: Int](j: Int):
         a.simd_store[_nelts](j, a.simd_load[_nelts](j) + b.simd_load[_nelts](j))
 
-    vectorize[nelts, _acc](size)
+    tile[_acc, nelts_alternatives](0, size)
 
 
 @always_inline
@@ -501,7 +501,7 @@ fn rmsnorm(
         else:
             tmp += x.offset(j).simd_load[nelts](0) ** 2
 
-    vectorize[nelts, _sum2](size)
+    tile[_sum2, nelts_alternatives](0, size)
 
     var ss: Float32 = tmp.reduce_add()
     ss = ss / size + 1e-5
@@ -513,7 +513,7 @@ fn rmsnorm(
         let val = weight.simd_load[_nelts](j) * ss * x.simd_load[_nelts](j)
         o.offset(j).simd_store[_nelts](0, val)
 
-    vectorize[nelts, _norm](size)
+    tile[_norm, nelts_alternatives](0, size)
 
 
 @always_inline
@@ -537,28 +537,30 @@ fn softmax(inout x: TensorF32, start: Int, end: Int):
 
     @parameter
     fn _max[_nelts: Int](ii: Int):
-        let val = x.simd_load[_nelts](start + ii).reduce_max()
+        let val = x.simd_load[_nelts](ii).reduce_max()
         if val > max_val:
             max_val = val
 
-    vectorize[nelts, _max](end - start)
+    tile[_max, nelts_alternatives](start, end)
 
-    var ssum: Float32 = 0.0
+    var tmp = SIMD[DType.float32, nelts](0)
 
     @parameter
     fn _exp[_nelts: Int](ii: Int):
-        x.simd_store[_nelts](
-            start + ii, math.exp(x.simd_load[_nelts](start + ii) - max_val)
-        )
-        ssum += x.simd_load[_nelts](start + ii).reduce_add()
+        x.simd_store[_nelts](ii, math.exp(x.simd_load[_nelts](ii) - max_val))
+        if _nelts < nelts:
+            tmp[0] += x.simd_load[_nelts](ii).reduce_add()
+        else:
+            tmp += x.simd_load[nelts](ii)
 
-    vectorize[nelts, _exp](end - start)
+    tile[_exp, nelts_alternatives](start, end)
+    var ssum = tmp.reduce_add()
 
     @parameter
     fn _norm[_nelts: Int](ii: Int):
-        x.simd_store[_nelts](start + ii, x.simd_load[_nelts](start + ii) / ssum)
+        x.simd_store[_nelts](ii, x.simd_load[_nelts](ii) / ssum)
 
-    vectorize[nelts, _norm](end - start)
+    tile[_norm, nelts_alternatives](start, end)
 
 
 @always_inline
@@ -574,34 +576,32 @@ fn batch_matmul[
     @parameter
     fn compute_row(i: Int):
         var tmp = StaticTuple[n, SIMD[DType.float32, nelts]]()
+
         @parameter
         fn init[k: Int]():
             tmp[k] = SIMD[DType.float32, nelts](0)
+
         unroll[n, init]()
         let row_offset = i * cols
 
         @parameter
         fn dot[_nelts: Int](j: Int):
-            if _nelts < nelts:  # take care of tail array elements with length <  nelts
-                let a = A.simd_load[_nelts](j)
-
-                @parameter
-                fn _multiply_tail[k: Int]():
+            @parameter
+            fn _multiply[k: Int]():
+                if (
+                    _nelts < nelts
+                ):  # take care of tail array elements with length <  nelts
+                    let a = A.simd_load[_nelts](j)
                     tmp[k][0] += (
                         a * B[k].simd_load[_nelts](row_offset + j)
                     ).reduce_add()
-
-                unroll[n, _multiply_tail]()
-            else:
-                let a = A.simd_load[nelts](j)
-
-                @parameter
-                fn _multiply[k: Int]():
+                else:
+                    let a = A.simd_load[nelts](j)
                     tmp[k] += a * B[k].simd_load[nelts](row_offset + j)
 
-                unroll[n, _multiply]()
+            unroll[n, _multiply]()
 
-        vectorize[nelts, dot](cols)
+        tile[dot, nelts_alternatives](0, cols)
 
         @parameter
         fn _reduce[k: Int]():
@@ -643,7 +643,9 @@ fn matmul(C: TensorSlice, A: TensorF32, B: TensorSlice) raises:
     # B (d,n) @ A (n,) -> C (d,)
     matmul_dimension_checks(A.shape(), B.shape())
     batch_matmul[1](
-        StaticTuple[1, BufferPtrFloat32](C.data(),),
+        StaticTuple[1, BufferPtrFloat32](
+            C.data(),
+        ),
         A.data(),
         StaticTuple[1, BufferPtrFloat32](B.data()),
         B.dim(0),
@@ -671,8 +673,9 @@ fn rope_rotation_llama(
 ) -> None:
     # stories model, llama2
     let head_size = config.head_size
+
     @parameter
-    fn head_loop(i:Int):
+    fn head_loop(i: Int):
         # Simple vectorization with (head_size // 2) steps gave junk transformer output.
         # Maybe because the nelt ranges end up overlapping between the steps.
         for j in range(0, config.head_size, 2):
@@ -687,8 +690,8 @@ fn rope_rotation_llama(
                 let k1 = state.k[i * head_size + j + 1]
                 state.k[i * head_size + j] = k0 * fcr - k1 * fci
                 state.k[i * head_size + j + 1] = k0 * fci + k1 * fcr
-    parallelize[head_loop](config.n_heads, workers)
 
+    parallelize[head_loop](config.n_heads, workers)
 
 
 @always_inline
@@ -755,7 +758,7 @@ fn transformer(
 
         # Multihead attention. Iterate over all heads in parallel.
         @parameter
-        fn loop_over_heads(h:Int):
+        fn loop_over_heads(h: Int):
             # Get the query vector for this head
             let q_offset = h * head_size
 
@@ -776,7 +779,7 @@ fn transformer(
                         * state.key_cache.simd_load[_nelts](k_offset + i)
                     ).reduce_add()
 
-                vectorize[nelts, score_fn](head_size)
+                tile[score_fn, nelts_alternatives](0, head_size)
                 score /= math.sqrt[DType.float32, 1](head_size)
 
                 # Save the score to the attention buffer
@@ -801,7 +804,7 @@ fn transformer(
                     ) + a * state.value_cache.simd_load[_nelts](v_offset + i)
                     state.xb.simd_store[_nelts](xb_offset + i, xbi)
 
-                vectorize[nelts, xb_accumulate](head_size)
+                tile[xb_accumulate, nelts_alternatives](0, head_size)
 
         parallelize[loop_over_heads](config.n_heads, workers)
         # Final matrix multiplication to get the output of the attention
@@ -830,7 +833,7 @@ fn transformer(
             # Elementwise multiply with w3(x)
             state.hb.simd_store[_nelts](i, hbi * state.hb2.simd_load[_nelts](i))
 
-        vectorize[nelts, silu](hidden_dim)
+        tile[silu, nelts_alternatives](0, hidden_dim)
         # Final matrix multiplication to get the output of the FFN
         matmul(state.xb, state.hb, TensorSlice(weights.w2, l))
 
@@ -1020,8 +1023,17 @@ fn main() raises:
     var tok = Tokenizer(config.vocab_size, tbuf)
 
     # print the layers number and vocab size
-    print("checkpoint size: ", fbuf.size, "[", fbuf.size // 1024 // 1024, "MB ]", 
-        "| n layers:", config.n_layers, "| vocab size:", tok.vocab_size)
+    print(
+        "checkpoint size: ",
+        fbuf.size,
+        "[",
+        fbuf.size // 1024 // 1024,
+        "MB ]",
+        "| n layers:",
+        config.n_layers,
+        "| vocab size:",
+        tok.vocab_size,
+    )
 
     # Create and initialize the application RunState
     var state = RunState(config)
