@@ -280,28 +280,33 @@ struct RunState:
     # buffer for hidden dimension in the ffn (hidden_dim,)
     var hb2: NDBuffer[1, DimList(), DType.float32]
     var q: NDBuffer[1, DimList(), DType.float32]  # query (dim,)
-    var k: NDBuffer[1, DimList(), DType.float32]  # key (kv_dim,)
-    var v: NDBuffer[1, DimList(), DType.float32]  # value (kv_dim,)
     # buffer for scores/attention values (n_heads, seq_len)
     var att: NDBuffer[2, DimList(), DType.float32]
     var logits: NDBuffer[1, DimList(), DType.float32]  # output logits
-    var key_cache: NDBuffer[3, DimList(), DType.float32]  # (layer, seq_len, dim)
-    var value_cache: NDBuffer[3, DimList(), DType.float32]  # (layer, seq_len, dim)
+    var key_cache: DynamicVector[
+        NDBuffer[1, DimList(), DType.float32]
+    ]  # (layer, seq_len, kv_dim)
+    var value_cache: DynamicVector[
+        NDBuffer[1, DimList(), DType.float32]
+    ]  # (layer, seq_len, kv_dim)
+
+    var buffers: DynamicVector[BufferPtrFloat32]
 
     @always_inline
     fn __init__(
         inout self,
         config: Config,
     ) raises:
+        @parameter
         fn create_weight[
             rank: Int
         ](*dims: Dim) raises -> NDBuffer[rank, DimList(), DType.float32]:
             let shape = DimList(dims)
             let num_elements = shape.product[rank]().get()
-            return NDBuffer[rank, DimList(), DType.float32](
-                DTypePointer[DType.float32].alloc(num_elements), shape
-            )
+            let data = self.alloc(num_elements)
+            return NDBuffer[rank, DimList(), DType.float32](data, shape)
 
+        self.buffers = DynamicVector[BufferPtrFloat32]()
         self.x = create_weight[1](config.dim)
         self.xb = create_weight[1](config.dim)
         self.xb2 = create_weight[1](config.dim)
@@ -310,31 +315,36 @@ struct RunState:
         self.q = create_weight[1](config.dim)
         self.att = create_weight[2](config.n_heads, config.seq_len)
         self.logits = create_weight[1](config.vocab_size)
-        self.key_cache = create_weight[3](
-            config.n_layers, config.seq_len, config.kv_dim
-        )
-        self.value_cache = create_weight[3](
-            config.n_layers, config.seq_len, config.kv_dim
-        )
-        # So their updates flow to the caches, k and v are slices with shared memory.
-        # Initialize with placeholders. The real tensors reference layer and position during forward pass.
-        self.k = create_weight[1](config.kv_dim)
-        self.v = create_weight[1](config.kv_dim)
+        self.key_cache = DynamicVector[NDBuffer[1, DimList(), DType.float32]]()
+        self.value_cache = DynamicVector[NDBuffer[1, DimList(), DType.float32]]()
+        for i in range(config.n_layers):
+            for j in range(config.seq_len):
+                self.key_cache.push_back(create_weight[1](config.kv_dim))
+                self.value_cache.push_back(create_weight[1](config.kv_dim))
+
+    fn alloc(inout self, size: Int) -> BufferPtrFloat32:
+        let data = BufferPtrFloat32.alloc(size)
+        self.buffers.push_back(data)
+        return data
+
+    fn __del__(owned self):
+        for i in range(len(self.buffers)):
+            self.buffers[i].free()
 
 
 struct TransformerWeights:
     var token_embedding_table: NDBuffer[2, DimList(), DType.float32]
-    var freq_cis_real: NDBuffer[2, DimList(), DType.float32]
-    var freq_cis_imag: NDBuffer[2, DimList(), DType.float32]
-    var rms_att_weight: NDBuffer[2, DimList(), DType.float32]
-    var wq: NDBuffer[3, DimList(), DType.float32]
-    var wk: NDBuffer[3, DimList(), DType.float32]
-    var wv: NDBuffer[3, DimList(), DType.float32]
-    var wo: NDBuffer[3, DimList(), DType.float32]
-    var rms_ffn_weight: NDBuffer[2, DimList(), DType.float32]
-    var w1: NDBuffer[3, DimList(), DType.float32]
-    var w3: NDBuffer[3, DimList(), DType.float32]
-    var w2: NDBuffer[3, DimList(), DType.float32]
+    var freq_cis_real: DynamicVector[NDBuffer[1, DimList(), DType.float32]]
+    var freq_cis_imag: DynamicVector[NDBuffer[1, DimList(), DType.float32]]
+    var rms_att_weight: DynamicVector[NDBuffer[1, DimList(), DType.float32]]
+    var wq: DynamicVector[NDBuffer[2, DimList(), DType.float32]]
+    var wk: DynamicVector[NDBuffer[2, DimList(), DType.float32]]
+    var wv: DynamicVector[NDBuffer[2, DimList(), DType.float32]]
+    var wo: DynamicVector[NDBuffer[2, DimList(), DType.float32]]
+    var rms_ffn_weight: DynamicVector[NDBuffer[1, DimList(), DType.float32]]
+    var w1: DynamicVector[NDBuffer[2, DimList(), DType.float32]]
+    var w3: DynamicVector[NDBuffer[2, DimList(), DType.float32]]
+    var w2: DynamicVector[NDBuffer[2, DimList(), DType.float32]]
     var rms_final_weight: NDBuffer[1, DimList(), DType.float32]
     var wcls: NDBuffer[2, DimList(), DType.float32]
 
@@ -353,22 +363,49 @@ struct TransformerWeights:
                 buf.bitcast_offset_f32(num_elements), shape
             )
 
+        fn load_vector_weights[
+            rank: Int
+        ](inout buf: FileBuf, layers: Int, *dims: Dim) raises -> DynamicVector[
+            NDBuffer[rank, DimList(), DType.float32]
+        ]:
+            var vector = DynamicVector[NDBuffer[rank, DimList(), DType.float32]](layers)
+            for i in range(layers):
+                if rank == 1:
+                    vector[i] = load_weights[rank](buf, dims[0])
+                else:
+                    vector[i] = load_weights[rank](buf, dims[0], dims[1])
+            return vector
+
         self.token_embedding_table = load_weights[2](buf, config.vocab_size, config.dim)
 
-        self.rms_att_weight = load_weights[2](buf, config.n_layers, config.dim)
-        self.wq = load_weights[3](buf, config.n_layers, config.dim, config.dim)
-        self.wk = load_weights[3](buf, config.n_layers, config.kv_dim, config.dim)
-        self.wv = load_weights[3](buf, config.n_layers, config.kv_dim, config.dim)
-        self.wo = load_weights[3](buf, config.n_layers, config.dim, config.dim)
-        self.rms_ffn_weight = load_weights[2](buf, config.n_layers, config.dim)
-        self.w1 = load_weights[3](buf, config.n_layers, config.hidden_dim, config.dim)
-        self.w2 = load_weights[3](buf, config.n_layers, config.dim, config.hidden_dim)
-        self.w3 = load_weights[3](buf, config.n_layers, config.hidden_dim, config.dim)
+        self.rms_att_weight = load_vector_weights[1](buf, config.n_layers, config.dim)
+        self.wq = load_vector_weights[2](buf, config.n_layers, config.dim, config.dim)
+        self.wk = load_vector_weights[2](
+            buf, config.n_layers, config.kv_dim, config.dim
+        )
+        self.wv = load_vector_weights[2](
+            buf, config.n_layers, config.kv_dim, config.dim
+        )
+        self.wo = load_vector_weights[2](buf, config.n_layers, config.dim, config.dim)
+        self.rms_ffn_weight = load_vector_weights[1](buf, config.n_layers, config.dim)
+        self.w1 = load_vector_weights[2](
+            buf, config.n_layers, config.hidden_dim, config.dim
+        )
+        self.w2 = load_vector_weights[2](
+            buf, config.n_layers, config.dim, config.hidden_dim
+        )
+        self.w3 = load_vector_weights[2](
+            buf, config.n_layers, config.hidden_dim, config.dim
+        )
         self.rms_final_weight = load_weights[1](buf, config.dim)
         # maybe need modifying for different model
         # config.head_size // 2 for stories and tinyllama-1.1
-        self.freq_cis_real = load_weights[2](buf, config.seq_len, config.head_size // 2)
-        self.freq_cis_imag = load_weights[2](buf, config.seq_len, config.head_size // 2)
+        self.freq_cis_real = load_vector_weights[1](
+            buf, config.seq_len, config.head_size // 2
+        )
+        self.freq_cis_imag = load_vector_weights[1](
+            buf, config.seq_len, config.head_size // 2
+        )
         if shared_weights:
             self.wcls = self.token_embedding_table
         else:
@@ -568,7 +605,8 @@ fn matmul(
 # rotate odd and even dim
 @always_inline
 fn rope_rotation_llama(
-    inout state: RunState,
+    inout q: NDBuffer[1, DimList(), DType.float32],
+    inout k: NDBuffer[1, DimList(), DType.float32],
     freq_cis_real_row: NDBuffer[1, DimList(), DType.float32],
     freq_cis_imag_row: NDBuffer[1, DimList(), DType.float32],
     config: Config,
@@ -582,38 +620,15 @@ fn rope_rotation_llama(
         for j in range(0, config.head_size, 2):
             let fcr = freq_cis_real_row[j // 2]
             let fci = freq_cis_imag_row[j // 2]
-            let q0 = state.q[i * head_size + j]
-            let q1 = state.q[i * head_size + j + 1]
-            state.q[i * head_size + j] = q0 * fcr - q1 * fci
-            state.q[i * head_size + j + 1] = q0 * fci + q1 * fcr
+            let q0 = q[i * head_size + j]
+            let q1 = q[i * head_size + j + 1]
+            q[i * head_size + j] = q0 * fcr - q1 * fci
+            q[i * head_size + j + 1] = q0 * fci + q1 * fcr
             if i < config.n_kv_heads:
-                let k0 = state.k[i * head_size + j]
-                let k1 = state.k[i * head_size + j + 1]
-                state.k[i * head_size + j] = k0 * fcr - k1 * fci
-                state.k[i * head_size + j + 1] = k0 * fci + k1 * fcr
-
-
-fn slice[
-    rank: Int, slice_dims: Int
-](buf: NDBuffer[rank, DimList(), DType.float32], *dims: Int) raises -> NDBuffer[
-    rank - slice_dims, DimList(), DType.float32
-]:
-    var offset_per_index = buf.num_elements()
-    var offset = 0
-    let shape: DimList
-    for ii in range(slice_dims):
-        offset_per_index /= buf.dim(ii)
-        offset += dims[ii] * offset_per_index
-    if rank - slice_dims == 1:
-        shape = DimList(buf.dim(rank - 1))
-    elif rank - slice_dims == 2:
-        shape = DimList(buf.dim(rank - 2), buf.dim(rank - 1))
-    else:
-        shape = DimList()
-        raise Error("slice not implemente for rank higher than 3")
-    return NDBuffer[rank - slice_dims, DimList(), DType.float32](
-        buf.data.offset(offset), shape
-    )
+                let k0 = k[i * head_size + j]
+                let k1 = k[i * head_size + j + 1]
+                k[i * head_size + j] = k0 * fcr - k1 * fci
+                k[i * head_size + j + 1] = k0 * fci + k1 * fcr
 
 
 @always_inline
@@ -636,31 +651,29 @@ fn transformer(
     memcpy[DType.float32](state.x.data, content_row, dim)
 
     # Pluck out the "pos" row of freq_cis_real and freq_cis_imag
-    let freq_cis_real_row = slice[2, 1](weights.freq_cis_real, pos)
-    let freq_cis_imag_row = slice[2, 1](weights.freq_cis_imag, pos)
+    let freq_cis_real_row = weights.freq_cis_real[pos]
+    let freq_cis_imag_row = weights.freq_cis_imag[pos]
 
     # Forward all the layers
     for l in range(config.n_layers):
         # Attention rmsnorm
-        rmsnorm(state.xb, state.x, slice[2, 1](weights.rms_att_weight, l))
+        rmsnorm(state.xb, state.x, weights.rms_att_weight[l])
         # QKV matmuls for this position
         let loff = l * config.seq_len * config.kv_dim
-        state.k = slice[3, 2](state.key_cache, l, pos)
-        state.v = slice[3, 2](state.value_cache, l, pos)
+        var k = state.key_cache[l * config.seq_len + pos]
+        var v = state.value_cache[l * config.seq_len + pos]
         multiple_matmul[3](
-            StaticTuple[3, NDBuffer[1, DimList(), DType.float32]](
-                state.q, state.k, state.v
-            ),
+            StaticTuple[3, NDBuffer[1, DimList(), DType.float32]](state.q, k, v),
             state.xb,
             StaticTuple[3, NDBuffer[2, DimList(), DType.float32]](
-                slice[3, 1](weights.wq, l),
-                slice[3, 1](weights.wk, l),
-                slice[3, 1](weights.wv, l),
+                weights.wq[l],
+                weights.wk[l],
+                weights.wv[l],
             ),
         )
 
         # Apply RoPE rotation to the q and k vectors for each head
-        rope_rotation_llama(state, freq_cis_real_row, freq_cis_imag_row, config)
+        rope_rotation_llama(state.q, k, freq_cis_real_row, freq_cis_imag_row, config)
 
         memset_zero(state.xb.data, state.xb.num_elements())
 
@@ -677,6 +690,7 @@ fn transformer(
             for t in range(pos + 1):
                 # Starting index of the key vector for this head and at this timestep
                 let k_offset = (h // kv_mul) * head_size
+                let k = state.key_cache[l * config.seq_len + t]
                 # Calculate the attention score as the dot product of q and k
                 var score: Float32 = 0.0
 
@@ -684,7 +698,7 @@ fn transformer(
                 fn score_fn[_nelts: Int](i: Int):
                     score += (
                         state.q.simd_load[_nelts](q_offset + i)
-                        * state.key_cache.simd_load[_nelts](l, t, k_offset + i)
+                        * k.simd_load[_nelts](k_offset + i)
                     ).reduce_add()
 
                 vectorize[nelts, score_fn](head_size)
@@ -700,7 +714,7 @@ fn transformer(
             for t in range(pos + 1):
                 # Starting index of the value vector for this head and at this timestep
                 let v_offset = (h // kv_mul) * head_size
-
+                let v = state.value_cache[l * config.seq_len + t]
                 # Get the attention weight for this timestep
                 let a = state.att[h, t]
                 # Accumulate the weighted value into xb
@@ -709,25 +723,25 @@ fn transformer(
                 fn xb_accumulate[_nelts: Int](i: Int):
                     let xbi = state.xb.simd_load[_nelts](
                         xb_offset + i
-                    ) + a * state.value_cache.simd_load[_nelts](l, t, v_offset + i)
+                    ) + a * v.simd_load[_nelts](v_offset + i)
                     state.xb.simd_store[_nelts](StaticIntTuple[1](xb_offset + i), xbi)
 
                 vectorize[nelts, xb_accumulate](head_size)
 
         parallelize[loop_over_heads](config.n_heads, workers)
         # Final matrix multiplication to get the output of the attention
-        matmul(state.xb2, state.xb, slice[3, 1](weights.wo, l))
+        matmul(state.xb2, state.xb, weights.wo[l])
         # Residual connection back into x
         accum(state.x, state.xb2)
         # FFN rmsnorm
-        rmsnorm(state.xb, state.x, slice[2, 1](weights.rms_ffn_weight, l))
+        rmsnorm(state.xb, state.x, weights.rms_ffn_weight[l])
 
         # Calculate self.w1(x) and self.w3(x) for FFN
         multiple_matmul[2](
             StaticTuple[2, NDBuffer[1, DimList(), DType.float32]](state.hb, state.hb2),
             state.xb,
             StaticTuple[2, NDBuffer[2, DimList(), DType.float32]](
-                slice[3, 1](weights.w1, l), slice[3, 1](weights.w3, l)
+                weights.w1[l], weights.w3[l]
             ),
         )
 
@@ -743,7 +757,7 @@ fn transformer(
 
         vectorize[nelts, silu](hidden_dim)
         # Final matrix multiplication to get the output of the FFN
-        matmul(state.xb, state.hb, slice[3, 1](weights.w2, l))
+        matmul(state.xb, state.hb, weights.w2[l])
 
         # Residual connection
         accum(state.x, state.xb)
