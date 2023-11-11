@@ -1025,5 +1025,6 @@ fn main() raises:
         if start == 0:
             start = time_in_ms()
 
+    _ = (fbuf,)
     let end = time_in_ms()
     print("\nachieved tok/s: ", (pos - 1) / (end - start) * 1000)
