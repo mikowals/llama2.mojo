@@ -1,8 +1,8 @@
 from algorithm import sum
-from algorithm import vectorize, parallelize, unroll
+from algorithm import vectorize, parallelize, unroll, tile
 from builtin import string
 from math import round
-from memory import memset_zero, memcpy
+from memory import memset_zero, memcpy, stack_allocation
 from memory.buffer import NDBuffer, Buffer
 from memory.unsafe import DTypePointer
 from random import rand
@@ -24,6 +24,26 @@ alias PointerString = Pointer[UInt8]
 alias BufferPtrType = DTypePointer[DType.uint8]
 alias BufferPtrFloat32 = DTypePointer[DType.float32]
 alias PointerStrings = Pointer[PointerString]
+
+
+@register_passable
+struct Accumulator[T: DType, size: Int]:
+    var data: DTypePointer[T]
+
+    @always_inline
+    fn __init__() -> Self:
+        let data = stack_allocation[size, T]()
+        memset_zero(data, size)
+        return Self {data: data}
+
+    @always_inline
+    fn accumulate[_size: Int](inout self, x: SIMD[T, _size]):
+        constrained[_size <= size, "Accumulator size exceeded"]()
+        self.data.simd_store[_size](self.data.simd_load[_size]() + x)
+
+    @always_inline
+    fn total(self) -> SIMD[T, 1]:
+        return self.data.simd_load[size]().reduce_add()
 
 
 fn read_val_int(inout buf: FileBuf) raises -> Int:
@@ -484,18 +504,15 @@ fn rmsnorm(
 ) -> None:
     let size = x.dim(0)
     # Calculate sum of squares
-    var tmp = SIMD[DType.float32, nelts](0)
+    var tmp = Accumulator[DType.float32, nelts]()
 
     @parameter
     fn _sum2[_nelts: Int](j: Int):
-        if _nelts < nelts:
-            tmp[0] += (x.simd_load[_nelts](j) ** 2).reduce_add()
-        else:
-            tmp += x.simd_load[nelts](j) ** 2
+        tmp.accumulate(x.simd_load[_nelts](j) ** 2)
 
     vectorize[nelts, _sum2](size)
 
-    var ss: Float32 = tmp.reduce_add()
+    var ss: Float32 = tmp.total()
     ss = ss / size + 1e-5
     ss = 1.0 / math.sqrt(ss)
 
@@ -527,16 +544,16 @@ fn softmax[
 
     vectorize[nelts, _max](end - start)
 
-    var ssum: Float32 = 0.0
+    var acc = Accumulator[DType.float32, nelts]()
 
     @parameter
     fn _exp[_nelts: Int](ii: Int):
-        x.data.simd_store[_nelts](
-            start + ii, math.exp(x.data.simd_load[_nelts](start + ii) - max_val)
-        )
-        ssum += x.data.simd_load[_nelts](start + ii).reduce_add()
+        let val = math.exp(x.data.simd_load[_nelts](start + ii) - max_val)
+        x.data.simd_store[_nelts](start + ii, val)
+        acc.accumulate(val)
 
     vectorize[nelts, _exp](end - start)
+    var ssum = acc.total()
 
     @parameter
     fn _norm[_nelts: Int](ii: Int):
@@ -559,43 +576,28 @@ fn multiple_matmul[
     let cols = B[0].dim(1)
 
     @parameter
-    fn compute_row(i: Int):
-        var tmp: StaticTuple[n, SIMD[DType.float32, nelts]]
+    fn calc_row(i: Int):
+        var tmp = StaticTuple[n, Accumulator[DType.float32, nelts]]()
 
-        @parameter
-        fn _init[k: Int]():
-            tmp[k] = SIMD[DType.float32, nelts](0)
-
-        unroll[n, _init]()
+        @unroll
+        for k in range(n):
+            tmp[k] = Accumulator[DType.float32, nelts]()
 
         @parameter
         fn dot[_nelts: Int](j: Int):
-            if _nelts < nelts:  # take care of tail array elements with length <  nelts
+            @unroll
+            for k in range(n):
                 let a = A.simd_load[_nelts](j)
+                let b = B[k].simd_load[_nelts](i, j)
+                tmp[k].accumulate(a * b)
 
-                @parameter
-                fn _multiply_tail[k: Int]():
-                    tmp[k][0] += (a * B[k].simd_load[_nelts](i, j)).reduce_add()
+        tile[dot, VariadicList[Int](nelts, nelts // 2, nelts // 4, 1)](0, cols)
 
-                unroll[n, _multiply_tail]()
-            else:
-                let a = A.simd_load[nelts](j)
+        @unroll
+        for k in range(n):
+            C[k][i] = tmp[k].total()
 
-                @parameter
-                fn _multiply[k: Int]():
-                    tmp[k] += a * B[k].simd_load[nelts](i, j)
-
-                unroll[n, _multiply]()
-
-        vectorize[nelts, dot](cols)
-
-        @parameter
-        fn _reduce[k: Int]():
-            C[k][i] = tmp[k].reduce_add()
-
-        unroll[n, _reduce]()
-
-    parallelize[compute_row](rows, workers)
+    parallelize[calc_row](rows, workers)
 
 
 @always_inline
