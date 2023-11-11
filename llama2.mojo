@@ -168,6 +168,9 @@ struct FileBuf:
             raise Error("Offset is before the beginning of the FileBuf")
         return self.offset
 
+    fn __del__(owned self):
+        self.data.free()
+
 
 @always_inline
 fn wrap(token: PointerString) -> PointerString:
@@ -206,6 +209,13 @@ struct Tokenizer:
             self.vocab.store(i, read_val_str(buf, slen))
 
         return None
+
+    fn __del__(owned self):
+        for i in range(self.vocab_size):
+            self.vocab[i].free()
+        self.vocab.free()
+        self.vocab_scores.free()
+        self.sorted_vocab.free()
 
     # sort vocab by string_compare
     @always_inline
