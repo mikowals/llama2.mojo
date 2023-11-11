@@ -672,19 +672,27 @@ fn transformer(
         # Attention rmsnorm
         rmsnorm(state.xb, state.x, weights.rms_att_weight[l])
         # QKV matmuls for this position
-        let loff = l * config.seq_len * config.kv_dim
         var k = state.key_cache[l * config.seq_len + pos]
         var v = state.value_cache[l * config.seq_len + pos]
-        multiple_matmul[3](
-            StaticTuple[3, NDBuffer[1, DimList(), DType.float32]](state.q, k, v),
-            state.xb,
-            StaticTuple[3, NDBuffer[2, DimList(), DType.float32]](
-                weights.wq[l],
-                weights.wk[l],
-                weights.wv[l],
-            ),
-        )
-
+        if kv_dim == dim:
+            multiple_matmul[3](
+                StaticTuple[3, NDBuffer[1, DimList(), DType.float32]](state.q, k, v),
+                state.xb,
+                StaticTuple[3, NDBuffer[2, DimList(), DType.float32]](
+                    weights.wq[l],
+                    weights.wk[l],
+                    weights.wv[l],
+                ),
+            )
+        else:
+            matmul(state.q, state.xb, weights.wq[l])
+            multiple_matmul[2](
+                StaticTuple[2, NDBuffer[1, DimList(), DType.float32]](k, v),
+                state.xb,
+                StaticTuple[2, NDBuffer[2, DimList(), DType.float32]](
+                    weights.wk[l], weights.wv[l]
+                ),
+            )
         # Apply RoPE rotation to the q and k vectors for each head
         rope_rotation_llama(state.q, k, freq_cis_real_row, freq_cis_imag_row, config)
 
