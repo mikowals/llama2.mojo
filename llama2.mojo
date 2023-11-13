@@ -26,6 +26,43 @@ alias BufferPtrFloat32 = DTypePointer[DType.float32]
 alias PointerStrings = Pointer[PointerString]
 
 
+@always_inline
+fn my_vectorize[
+    simd_width: Int, func: fn[width: Int] (Int) capturing -> None
+](size: Int):
+    my_tile[func, VariadicList[Int](simd_width)](0, size)
+
+
+@always_inline
+fn my_vectorize[
+    simd_widths: VariadicList[Int], func: fn[width: Int] (Int) capturing -> None
+](size: Int):
+    my_tile[func, simd_widths](0, size)
+
+
+@always_inline
+fn my_tile[
+    func: fn[width: Int] (Int) capturing -> None, simd_widths: VariadicList[Int]
+](initial_offset: Int, size: Int):
+    var offset = initial_offset
+    alias width_count = len(simd_widths)
+
+    @parameter
+    fn simd_widths_loop[i: Int]():
+        alias simd_width = simd_widths[i]
+        if simd_width <= size - offset:
+            let iterations = (size - offset) // simd_width
+            for j in range(iterations):
+                func[simd_width](j * simd_width + offset)
+
+            offset += simd_width * iterations
+
+    unroll[width_count, simd_widths_loop]()
+
+    for i in range(offset, size):
+        func[1](i)
+
+
 @register_passable
 struct Accumulator[T: DType, size: Int]:
     var data: DTypePointer[T]
@@ -493,7 +530,7 @@ fn accum(
             StaticIntTuple[1](j), a.simd_load[_nelts](j) + b.simd_load[_nelts](j)
         )
 
-    vectorize[nelts, _acc](size)
+    my_vectorize[nelts, _acc](size)
 
 
 @always_inline
@@ -510,7 +547,7 @@ fn rmsnorm(
     fn _sum2[_nelts: Int](j: Int):
         tmp.accumulate(x.simd_load[_nelts](j) ** 2)
 
-    vectorize[nelts, _sum2](size)
+    my_vectorize[nelts, _sum2](size)
 
     var ss: Float32 = tmp.total()
     ss = ss / size + 1e-5
@@ -522,7 +559,7 @@ fn rmsnorm(
         let val = weight.simd_load[_nelts](j) * ss * x.simd_load[_nelts](j)
         o.simd_store[_nelts](StaticIntTuple[1](j), val)
 
-    vectorize[nelts, _norm](size)
+    my_vectorize[nelts, _norm](size)
 
 
 @always_inline
@@ -542,7 +579,7 @@ fn softmax[
         if val > max_val:
             max_val = val
 
-    vectorize[nelts, _max](end - start)
+    my_vectorize[Int(2), _max](end - start)
 
     var acc = Accumulator[DType.float32, nelts]()
 
@@ -552,7 +589,7 @@ fn softmax[
         x.data.simd_store[_nelts](start + ii, val)
         acc.accumulate(val)
 
-    vectorize[nelts, _exp](end - start)
+    my_vectorize[nelts, _exp](end - start)
     var ssum = acc.total()
 
     @parameter
@@ -561,7 +598,7 @@ fn softmax[
             start + ii, x.data.simd_load[_nelts](start + ii) / ssum
         )
 
-    vectorize[nelts, _norm](end - start)
+    my_vectorize[nelts, _norm](end - start)
 
 
 @always_inline
@@ -722,7 +759,7 @@ fn transformer(
                         * k.simd_load[_nelts](k_offset + i)
                     ).reduce_add()
 
-                vectorize[nelts, score_fn](head_size)
+                my_vectorize[nelts, score_fn](head_size)
                 score /= math.sqrt[DType.float32, 1](head_size)
 
                 # Save the score to the attention buffer
@@ -747,7 +784,7 @@ fn transformer(
                     ) + a * v.simd_load[_nelts](v_offset + i)
                     state.xb.simd_store[_nelts](StaticIntTuple[1](xb_offset + i), xbi)
 
-                vectorize[nelts, xb_accumulate](head_size)
+                my_vectorize[nelts, xb_accumulate](head_size)
 
         parallelize[loop_over_heads](config.n_heads, workers)
         # Final matrix multiplication to get the output of the attention
@@ -776,7 +813,7 @@ fn transformer(
                 StaticIntTuple[1](i), hbi * state.hb2.simd_load[_nelts](i)
             )
 
-        vectorize[nelts, silu](hidden_dim)
+        my_vectorize[nelts, silu](hidden_dim)
         # Final matrix multiplication to get the output of the FFN
         matmul(state.xb, state.hb, weights.w2[l])
 
