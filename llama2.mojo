@@ -37,6 +37,10 @@ struct Accumulator[T: DType, size: Int]:
         return Self {data: data}
 
     @always_inline
+    fn zero(inout self):
+        memset_zero(self.data, size)
+
+    @always_inline
     fn accumulate[_size: Int](inout self, x: SIMD[T, _size]):
         constrained[_size <= size, "Accumulator size exceeded"]()
         self.data.simd_store[_size](self.data.simd_load[_size]() + x)
@@ -577,9 +581,11 @@ fn multiple_matmul[
 
     @parameter
     fn calc_row(i: Int):
+        var tmp = Accumulator[DType.float32, nelts]()
+
         @unroll
         for k in range(n):
-            var tmp = Accumulator[DType.float32, nelts]()
+            tmp.zero()
 
             @parameter
             fn dot[_nelts: Int](j: Int):
