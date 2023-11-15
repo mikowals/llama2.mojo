@@ -572,33 +572,51 @@ fn multiple_matmul[
     A: NDBuffer[1, DimList(), DType.float32],
     B: StaticTuple[n, NDBuffer[2, DimList(), DType.float32]],
 ):
-    let rows = B[0].dim(0)
+    var rows = StaticIntTuple[n]()
+    for k in range(n):
+        rows[k] = B[k].dim(0)
     let cols = B[0].dim(1)
 
     @parameter
     fn calc_row(i: Int):
         var tmp = StaticTuple[n, Accumulator[DType.float32, nelts]]()
 
-        @unroll
-        for k in range(n):
-            tmp[k] = Accumulator[DType.float32, nelts]()
+        @parameter
+        if n == 1:
+            tmp[0] = Accumulator[DType.float32, nelts]()
+        else:
+            @unroll
+            for k in range(n):
+                if i < rows[k]:
+                    tmp[k] = Accumulator[DType.float32, nelts]()
 
         @parameter
         fn dot[_nelts: Int](j: Int):
             let a = A.simd_load[_nelts](j)
 
-            @unroll
-            for k in range(n):
-                let b = B[k].simd_load[_nelts](i, j)
-                tmp[k].accumulate(a * b)
+            @parameter
+            if n == 1:
+                let b = B[0].simd_load[_nelts](i, j)
+                    tmp[0].accumulate(a * b)
+            else:
+                @unroll
+                for k in range(n):
+                    if i < rows[k]:
+                        let b = B[k].simd_load[_nelts](i, j)
+                        tmp[k].accumulate(a * b)
 
         tile[dot, VariadicList[Int](nelts, nelts // 2, nelts // 4, 1)](0, cols)
 
-        @unroll
-        for k in range(n):
-            C[k][i] = tmp[k].total()
+        @parameter
+        if n == 1:
+            C[0][i] = tmp[0].total()
+        else:
+            @unroll
+            for k in range(n):
+                if i < rows[k]:
+                    C[k][i] = tmp[k].total()
 
-    parallelize[calc_row](rows, workers)
+    parallelize[calc_row](rows[0], workers)
 
 
 @always_inline
@@ -674,25 +692,17 @@ fn transformer(
         # QKV matmuls for this position
         var k = state.key_cache[l * config.seq_len + pos]
         var v = state.value_cache[l * config.seq_len + pos]
-        if kv_dim == dim:
-            multiple_matmul[3](
-                StaticTuple[3, NDBuffer[1, DimList(), DType.float32]](state.q, k, v),
-                state.xb,
-                StaticTuple[3, NDBuffer[2, DimList(), DType.float32]](
-                    weights.wq[l],
-                    weights.wk[l],
-                    weights.wv[l],
-                ),
-            )
-        else:
-            matmul(state.q, state.xb, weights.wq[l])
-            multiple_matmul[2](
-                StaticTuple[2, NDBuffer[1, DimList(), DType.float32]](k, v),
-                state.xb,
-                StaticTuple[2, NDBuffer[2, DimList(), DType.float32]](
-                    weights.wk[l], weights.wv[l]
-                ),
-            )
+
+        multiple_matmul[3](
+            StaticTuple[3, NDBuffer[1, DimList(), DType.float32]](state.q, k, v),
+            state.xb,
+            StaticTuple[3, NDBuffer[2, DimList(), DType.float32]](
+                weights.wq[l],
+                weights.wk[l],
+                weights.wv[l],
+            ),
+        )
+
         # Apply RoPE rotation to the q and k vectors for each head
         rope_rotation_llama(state.q, k, freq_cis_real_row, freq_cis_imag_row, config)
 
