@@ -323,10 +323,7 @@ struct RunState:
     var buffers: DynamicVector[BufferPtrFloat32]
 
     @always_inline
-    fn __init__(
-        inout self,
-        config: Config,
-    ) raises:
+    fn __init__(inout self, config: Config) raises:
         @parameter
         fn create_weight[
             rank: Int
@@ -382,11 +379,10 @@ struct TransformerWeights:
     fn __init__(
         inout self, config: Config, shared_weights: Int, inout buf: FileBuf
     ) raises:
+        @parameter
         fn load_weights[
             rank: Int
-        ](inout buf: FileBuf, *dims: Dim) raises -> NDBuffer[
-            rank, DimList(), DType.float32
-        ]:
+        ](*dims: Dim) raises -> NDBuffer[rank, DimList(), DType.float32]:
             let shape = DimList(dims)
             let num_elements = shape.product[rank]().get()
             return NDBuffer[rank, DimList(), DType.float32](
@@ -395,51 +391,41 @@ struct TransformerWeights:
 
         fn load_vector_weights[
             rank: Int
-        ](inout buf: FileBuf, layers: Int, *dims: Dim) raises -> DynamicVector[
+        ](layers: Int, *dims: Dim) raises -> DynamicVector[
             NDBuffer[rank, DimList(), DType.float32]
         ]:
             var vector = DynamicVector[NDBuffer[rank, DimList(), DType.float32]](layers)
             for i in range(layers):
                 if rank == 1:
-                    vector[i] = load_weights[rank](buf, dims[0])
+                    vector[i] = load_weights[rank](dims[0])
                 else:
-                    vector[i] = load_weights[rank](buf, dims[0], dims[1])
+                    vector[i] = load_weights[rank](dims[0], dims[1])
             return vector
 
-        self.token_embedding_table = load_weights[2](buf, config.vocab_size, config.dim)
+        self.token_embedding_table = load_weights[2](config.vocab_size, config.dim)
 
-        self.rms_att_weight = load_vector_weights[1](buf, config.n_layers, config.dim)
-        self.wq = load_vector_weights[2](buf, config.n_layers, config.dim, config.dim)
-        self.wk = load_vector_weights[2](
-            buf, config.n_layers, config.kv_dim, config.dim
-        )
-        self.wv = load_vector_weights[2](
-            buf, config.n_layers, config.kv_dim, config.dim
-        )
-        self.wo = load_vector_weights[2](buf, config.n_layers, config.dim, config.dim)
-        self.rms_ffn_weight = load_vector_weights[1](buf, config.n_layers, config.dim)
-        self.w1 = load_vector_weights[2](
-            buf, config.n_layers, config.hidden_dim, config.dim
-        )
-        self.w2 = load_vector_weights[2](
-            buf, config.n_layers, config.dim, config.hidden_dim
-        )
-        self.w3 = load_vector_weights[2](
-            buf, config.n_layers, config.hidden_dim, config.dim
-        )
-        self.rms_final_weight = load_weights[1](buf, config.dim)
+        self.rms_att_weight = load_vector_weights[1](config.n_layers, config.dim)
+        self.wq = load_vector_weights[2](config.n_layers, config.dim, config.dim)
+        self.wk = load_vector_weights[2](config.n_layers, config.kv_dim, config.dim)
+        self.wv = load_vector_weights[2](config.n_layers, config.kv_dim, config.dim)
+        self.wo = load_vector_weights[2](config.n_layers, config.dim, config.dim)
+        self.rms_ffn_weight = load_vector_weights[1](config.n_layers, config.dim)
+        self.w1 = load_vector_weights[2](config.n_layers, config.hidden_dim, config.dim)
+        self.w2 = load_vector_weights[2](config.n_layers, config.dim, config.hidden_dim)
+        self.w3 = load_vector_weights[2](config.n_layers, config.hidden_dim, config.dim)
+        self.rms_final_weight = load_weights[1](config.dim)
         # maybe need modifying for different model
         # config.head_size // 2 for stories and tinyllama-1.1
         self.freq_cis_real = load_vector_weights[1](
-            buf, config.seq_len, config.head_size // 2
+            config.seq_len, config.head_size // 2
         )
         self.freq_cis_imag = load_vector_weights[1](
-            buf, config.seq_len, config.head_size // 2
+            config.seq_len, config.head_size // 2
         )
         if shared_weights:
             self.wcls = self.token_embedding_table
         else:
-            self.wcls = load_weights[2](buf, config.vocab_size, config.dim)
+            self.wcls = load_weights[2](config.vocab_size, config.dim)
 
 
 @always_inline
@@ -494,6 +480,20 @@ fn accum(
         )
 
     vectorize[nelts, _acc](size)
+
+
+fn my_decorator(func: fn () -> None) -> fn () capturing -> None:
+    @parameter
+    fn stuff():
+        func()
+        print("did it")
+
+    return stuff
+
+
+@my_decorator
+fn tests():
+    print("did we decorate it?")
 
 
 @always_inline
@@ -577,26 +577,19 @@ fn multiple_matmul[
 
     @parameter
     fn calc_row(i: Int):
-        var tmp = StaticTuple[n, Accumulator[DType.float32, nelts]]()
-
         @unroll
         for k in range(n):
-            tmp[k] = Accumulator[DType.float32, nelts]()
+            var tmp = Accumulator[DType.float32, nelts]()
 
-        @parameter
-        fn dot[_nelts: Int](j: Int):
-            let a = A.simd_load[_nelts](j)
-
-            @unroll
-            for k in range(n):
+            @parameter
+            fn dot[_nelts: Int](j: Int):
+                let a = A.simd_load[_nelts](j)
                 let b = B[k].simd_load[_nelts](i, j)
-                tmp[k].accumulate(a * b)
+                tmp.accumulate(a * b)
 
-        tile[dot, VariadicList[Int](nelts, nelts // 2, nelts // 4, 1)](0, cols)
+            tile[dot, VariadicList[Int](nelts, nelts // 2, nelts // 4, 1)](0, cols)
 
-        @unroll
-        for k in range(n):
-            C[k][i] = tmp[k].total()
+            C[k][i] = tmp.total()
 
     parallelize[calc_row](rows, workers)
 
@@ -903,6 +896,7 @@ fn print_usage():
 
 @always_inline
 fn main() raises:
+    tests()
     workers = num_cores()
     print("num hardware threads: ", num_cores())
     print("SIMD vector width: ", nelts)
