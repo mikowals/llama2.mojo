@@ -573,50 +573,41 @@ fn multiple_matmul[
     B: StaticTuple[n, NDBuffer[2, DimList(), DType.float32]],
 ):
     var rows = StaticIntTuple[n]()
+    var max_rows = B[0].dim(0)
+
     for k in range(n):
         rows[k] = B[k].dim(0)
+        if rows[k] > max_rows:
+            max_rows = rows[k]
     let cols = B[0].dim(1)
 
     @parameter
     fn calc_row(i: Int):
         var tmp = StaticTuple[n, Accumulator[DType.float32, nelts]]()
 
-        @parameter
-        if n == 1:
-            tmp[0] = Accumulator[DType.float32, nelts]()
-        else:
-            @unroll
-            for k in range(n):
-                if i < rows[k]:
-                    tmp[k] = Accumulator[DType.float32, nelts]()
+        @unroll
+        for k in range(n):
+            if i < rows[k]:
+                tmp[k] = Accumulator[DType.float32, nelts]()
 
         @parameter
         fn dot[_nelts: Int](j: Int):
             let a = A.simd_load[_nelts](j)
 
-            @parameter
-            if n == 1:
-                let b = B[0].simd_load[_nelts](i, j)
-                    tmp[0].accumulate(a * b)
-            else:
-                @unroll
-                for k in range(n):
-                    if i < rows[k]:
-                        let b = B[k].simd_load[_nelts](i, j)
-                        tmp[k].accumulate(a * b)
-
-        tile[dot, VariadicList[Int](nelts, nelts // 2, nelts // 4, 1)](0, cols)
-
-        @parameter
-        if n == 1:
-            C[0][i] = tmp[0].total()
-        else:
             @unroll
             for k in range(n):
                 if i < rows[k]:
-                    C[k][i] = tmp[k].total()
+                    let b = B[k].simd_load[_nelts](i, j)
+                    tmp[k].accumulate(a * b)
 
-    parallelize[calc_row](rows[0], workers)
+        tile[dot, VariadicList[Int](nelts, nelts // 2, nelts // 4, 1)](0, cols)
+
+        @unroll
+        for k in range(n):
+            if i < rows[k]:
+                C[k][i] = tmp[k].total()
+
+    parallelize[calc_row](max_rows, workers)
 
 
 @always_inline
