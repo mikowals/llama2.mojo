@@ -9,6 +9,7 @@ from random import rand
 from runtime.llcl import num_cores
 from sys import argv
 from tensor import Tensor, TensorShape, TensorSpec
+from utils.index import product
 
 # The SIMD vector width.
 from sys.info import simdwidthof
@@ -19,7 +20,7 @@ import time
 
 var workers = 0
 
-alias nelts = (4*simdwidthof[DType.float32]())
+alias nelts = (4 * simdwidthof[DType.float32]())
 
 alias PointerString = Pointer[UInt8]
 alias BufferPtrType = DTypePointer[DType.uint8]
@@ -53,43 +54,50 @@ struct Accumulator[T: DType, width: Int]:
         return self.data.simd_load[width]().reduce_add()
 
 
-struct TensorSlice:
+@register_passable("trivial")
+struct TensorSlice[_rank: Int]:
     # Provides a view into a tensor representing a 1D slice on its first or first 2 dimensions.
     # Same function signatures as Tensor but without owning the data.
     var _data: BufferPtrFloat32
-    var _shape: TensorShape
+    var _shape: StaticIntTuple[_rank]
 
-    fn __init__(inout self, t: TensorF32, layer: Int) raises:
+    @always_inline
+    fn __init__(t: TensorF32, layer: Int) raises -> Self:
         let elements_per_layer = t.num_elements() // t.dim(0)
-        self._data = t.data().offset(layer * elements_per_layer)
+        let _data = t.data().offset(layer * elements_per_layer)
+        let _shape: StaticIntTuple[_rank]
         if t.rank() == 2:
-            self._shape = TensorShape(t.dim(1))
+            _shape = StaticIntTuple[_rank](t.dim(1))
         elif t.rank() == 3:
-            self._shape = TensorShape(t.dim(1), t.dim(2))
+            _shape = StaticIntTuple[_rank](t.dim(1), t.dim(2))
         else:
             # Compiler complains if _shape not defined
-            self._shape = TensorShape(1)
+            _shape = StaticIntTuple[_rank]()
             raise Error("TensorSlice: rank greater than 3 not implemented.")
 
-    fn __init__(inout self, t: TensorF32, layer: Int, row: Int) raises:
+        return Self {_data: _data, _shape: _shape}
+
+    @always_inline
+    fn __init__(t: TensorF32, layer: Int, row: Int) raises -> Self:
         let elements_per_layer = t.num_elements() // t.dim(0)
         let elements_per_row = elements_per_layer // t.dim(1)
-        self._data = t.data().offset(
-            layer * elements_per_layer + row * elements_per_row
-        )
+        let _data = t.data().offset(layer * elements_per_layer + row * elements_per_row)
+        let _shape: StaticIntTuple[_rank]
         if t.rank() == 3:
-            self._shape = TensorShape(t.dim(2))
+            _shape = StaticIntTuple[_rank](t.dim(2))
         elif t.rank() == 1:
             # Compiler complains if _shape not defined
-            self._shape = TensorShape(1)
+            _shape = StaticIntTuple[_rank]()
             raise Error(
                 "Trying to slice a 1D Tensor by layer and row.  This requires a 3D"
                 " Tensor."
             )
         else:
             # Compiler complains if _shape not defined
-            self._shape = TensorShape(1)
+            _shape = StaticIntTuple[_rank]()
             raise Error("TensorSlice: rank greater than 3 not implemented.")
+
+        return Self {_data: _data, _shape: _shape}
 
     fn data(self) -> BufferPtrFloat32:
         return self._data
@@ -98,13 +106,13 @@ struct TensorSlice:
         return self._shape
 
     fn num_elements(self) -> Int:
-        return self._shape.num_elements()
+        return product[_rank](self._shape, _rank)
 
     fn dim(self, idx: Int) -> Int:
         return self._shape[idx]
 
     fn rank(self) -> Int:
-        return self._shape.rank()
+        return self._rank
 
     fn simd_load[nelts: Int](self, idx: Int) -> SIMD[DType.float32, nelts]:
         return self._data.simd_load[nelts](idx)
@@ -389,13 +397,12 @@ struct RunState:
     var hb: TensorF32  # buffer for hidden dimension in the ffn (hidden_dim,)
     var hb2: TensorF32  # buffer for hidden dimension in the ffn (hidden_dim,)
     var q: TensorF32  # query (dim,)
-    var k: TensorSlice  # key (kv_dim,)
-    var v: TensorSlice  # value (kv_dim,)
+    var k: TensorSlice[1]  # key (kv_dim,)
+    var v: TensorSlice[1]  # value (kv_dim,)
     var att: TensorF32  # buffer for scores/attention values (n_heads, seq_len)
     var logits: TensorF32  # output logits
     var key_cache: TensorF32  # (layer, seq_len, dim)
     var value_cache: TensorF32  # (layer, seq_len, dim)
-
 
     fn __init__(inout self, config: Config) raises:
         self.x = TensorF32(config.dim)
@@ -410,8 +417,8 @@ struct RunState:
         self.value_cache = TensorF32(config.n_layers, config.seq_len, config.kv_dim)
         # So their updates flow to the caches, k and v are slices with shared memory.
         # Initialize with placeholders. The real tensors reference layer and position during forward pass.
-        self.k = TensorSlice(TensorF32(TensorShape(1, config.kv_dim)), 1)
-        self.v = TensorSlice(TensorF32(TensorShape(1, config.kv_dim)), 1)
+        self.k = TensorSlice[1](TensorF32(TensorShape(1, config.kv_dim)), 1)
+        self.v = TensorSlice[1](TensorF32(TensorShape(1, config.kv_dim)), 1)
 
 
 struct TransformerWeights:
@@ -474,10 +481,10 @@ fn read_file(file_name: String, inout buf: FileBuf) raises:
     let cp_buf: BufferPtrType = BufferPtrType.alloc(cp_size)
 
     let data_ptr = data._as_ptr().bitcast[DType.uint8]()
-    
+
     for i in range(cp_size):
-        cp_buf.store(i,data_ptr.load(i))
-    
+        cp_buf.store(i, data_ptr.load(i))
+
     # don't free data
     _ = data
 
@@ -498,7 +505,7 @@ fn config_init(inout config: Config, inout buf: FileBuf, print_config: Int = 0) 
     config.head_size = config.dim // config.n_heads
     config.kv_dim = (config.n_kv_heads * config.dim) // config.n_heads
     config.kv_mul = config.n_heads // config.n_kv_heads
-    
+
     if print_config:
         print("config: dim, hidden_dim", config.dim, config.hidden_dim)
         print("config: n_layers, n_heads", config.n_layers, config.n_heads)
@@ -583,6 +590,7 @@ fn softmax(inout x: TensorF32, start: Int, end: Int):
     vectorize[nelts, _exp](end - start)
 
     var ssum = acc.total()
+
     @parameter
     fn _norm[_nelts: Int](ii: Int):
         x.simd_store[_nelts](start + ii, x.simd_load[_nelts](start + ii) / ssum)
@@ -603,6 +611,7 @@ fn batch_matmul[
     @parameter
     fn compute_row(i: Int):
         var tmp = StaticTuple[n, Accumulator[DType.float32, nelts]]()
+
         @unroll
         for k in range(n):
             tmp[k] = Accumulator[DType.float32, nelts]()
@@ -657,7 +666,9 @@ fn matmul(C: TensorSlice, A: TensorF32, B: TensorSlice) raises:
     # B (d,n) @ A (n,) -> C (d,)
     matmul_dimension_checks(A.shape(), B.shape())
     batch_matmul[1](
-        StaticTuple[1, BufferPtrFloat32](C.data(),),
+        StaticTuple[1, BufferPtrFloat32](
+            C.data(),
+        ),
         A.data(),
         StaticTuple[1, BufferPtrFloat32](B.data()),
         B.dim(0),
@@ -685,8 +696,9 @@ fn rope_rotation_llama(
 ) -> None:
     # stories model, llama2
     let head_size = config.head_size
+
     @parameter
-    fn head_loop(i:Int):
+    fn head_loop(i: Int):
         # Simple vectorization with (head_size // 2) steps gave junk transformer output.
         # Maybe because the nelt ranges end up overlapping between the steps.
         for j in range(0, config.head_size, 2):
@@ -701,8 +713,8 @@ fn rope_rotation_llama(
                 let k1 = state.k[i * head_size + j + 1]
                 state.k[i * head_size + j] = k0 * fcr - k1 * fci
                 state.k[i * head_size + j + 1] = k0 * fci + k1 * fcr
-    parallelize[head_loop](config.n_heads, workers)
 
+    parallelize[head_loop](config.n_heads, workers)
 
 
 @always_inline
@@ -725,17 +737,17 @@ fn transformer(
     memcpy[DType.float32](state.x.data(), content_row, dim)
 
     # Pluck out the "pos" row of freq_cis_real and freq_cis_imag
-    let freq_cis_real_row = TensorSlice(weights.freq_cis_real, pos)
-    let freq_cis_imag_row = TensorSlice(weights.freq_cis_imag, pos)
+    let freq_cis_real_row = TensorSlice[1](weights.freq_cis_real, pos)
+    let freq_cis_imag_row = TensorSlice[1](weights.freq_cis_imag, pos)
 
     # Forward all the layers
     for l in range(config.n_layers):
         # Attention rmsnorm
-        rmsnorm(state.xb, state.x, TensorSlice(weights.rms_att_weight, l))
+        rmsnorm(state.xb, state.x, TensorSlice[1](weights.rms_att_weight, l))
         # QKV matmuls for this position
         let loff = l * config.seq_len * config.kv_dim
-        state.k = TensorSlice(state.key_cache, l, pos)
-        state.v = TensorSlice(state.value_cache, l, pos)
+        state.k = TensorSlice[1](state.key_cache, l, pos)
+        state.v = TensorSlice[1](state.value_cache, l, pos)
         if kv_dim == dim:
             batch_matmul[3](
                 StaticTuple[3, BufferPtrFloat32](
@@ -743,20 +755,21 @@ fn transformer(
                 ),
                 state.xb.data(),
                 StaticTuple[3, BufferPtrFloat32](
-                    TensorSlice(weights.wq, l).data(),
-                    TensorSlice(weights.wk, l).data(),
-                    TensorSlice(weights.wv, l).data(),
+                    TensorSlice[2](weights.wq, l).data(),
+                    TensorSlice[2](weights.wk, l).data(),
+                    TensorSlice[2](weights.wv, l).data(),
                 ),
                 dim,
                 dim,
             )
         else:
-            matmul(state.q, state.xb, TensorSlice(weights.wq, l))
+            matmul(state.q, state.xb, TensorSlice[2](weights.wq, l))
             batch_matmul[2](
                 StaticTuple[2, BufferPtrFloat32](state.k.data(), state.v.data()),
                 state.xb.data(),
                 StaticTuple[2, BufferPtrFloat32](
-                    TensorSlice(weights.wk, l).data(), TensorSlice(weights.wv, l).data()
+                    TensorSlice[2](weights.wk, l).data(),
+                    TensorSlice[2](weights.wv, l).data(),
                 ),
                 kv_dim,
                 dim,
@@ -769,7 +782,7 @@ fn transformer(
 
         # Multihead attention. Iterate over all heads in parallel.
         @parameter
-        fn loop_over_heads(h:Int):
+        fn loop_over_heads(h: Int):
             # Get the query vector for this head
             let q_offset = h * head_size
 
@@ -819,18 +832,19 @@ fn transformer(
 
         parallelize[loop_over_heads](config.n_heads, workers)
         # Final matrix multiplication to get the output of the attention
-        matmul(state.xb2, state.xb, TensorSlice(weights.wo, l))
+        matmul(state.xb2, state.xb, TensorSlice[2](weights.wo, l))
         # Residual connection back into x
         accum(state.x, state.xb2)
         # FFN rmsnorm
-        rmsnorm(state.xb, state.x, TensorSlice(weights.rms_ffn_weight, l))
+        rmsnorm(state.xb, state.x, TensorSlice[2](weights.rms_ffn_weight, l))
 
         # Calculate self.w1(x) and self.w3(x) for FFN
         batch_matmul[2](
             StaticTuple[2, BufferPtrFloat32](state.hb.data(), state.hb2.data()),
             state.xb.data(),
             StaticTuple[2, BufferPtrFloat32](
-                TensorSlice(weights.w1, l).data(), TensorSlice(weights.w3, l).data()
+                TensorSlice[2](weights.w1, l).data(),
+                TensorSlice[2](weights.w3, l).data(),
             ),
             hidden_dim,
             dim,
@@ -846,7 +860,7 @@ fn transformer(
 
         vectorize[nelts, silu](hidden_dim)
         # Final matrix multiplication to get the output of the FFN
-        matmul(state.xb, state.hb, TensorSlice(weights.w2, l))
+        matmul(state.xb, state.hb, TensorSlice[2](weights.w2, l))
 
         # Residual connection
         accum(state.x, state.xb)
@@ -1037,8 +1051,17 @@ fn main() raises:
     var tok = Tokenizer(config.vocab_size, tbuf)
 
     # print the layers number and vocab size
-    print("checkpoint size: ", fbuf.size, "[", fbuf.size // 1024 // 1024, "MB ]", 
-        "| n layers:", config.n_layers, "| vocab size:", tok.vocab_size)
+    print(
+        "checkpoint size: ",
+        fbuf.size,
+        "[",
+        fbuf.size // 1024 // 1024,
+        "MB ]",
+        "| n layers:",
+        config.n_layers,
+        "| vocab size:",
+        tok.vocab_size,
+    )
 
     # Create and initialize the application RunState
     var state = RunState(config)
