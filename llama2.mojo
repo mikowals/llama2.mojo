@@ -19,7 +19,7 @@ import time
 
 var workers = 0
 
-alias nelts = (4*simdwidthof[DType.float32]())
+alias nelts = (4 * simdwidthof[DType.float32]())
 
 alias PointerString = Pointer[UInt8]
 alias BufferPtrType = DTypePointer[DType.uint8]
@@ -240,15 +240,21 @@ fn quicksort(
         quicksort(array, indices, pi + 1, high)
 
 
+@register_passable
 struct FileBuf:
     var data: BufferPtrType
     var offset: Int
     var size: Int
 
-    fn __init__(inout self):
-        self.data = BufferPtrType()
-        self.offset = 0
-        self.size = 0
+    fn __init__() -> Self:
+        let data = BufferPtrType()
+        let offset = 0
+        let size = 0
+        return Self {
+            data: data,
+            offset: offset,
+            size: size,
+        }
 
     fn __del__(owned self):
         self.data.free()
@@ -396,7 +402,6 @@ struct RunState:
     var key_cache: TensorF32  # (layer, seq_len, dim)
     var value_cache: TensorF32  # (layer, seq_len, dim)
 
-
     fn __init__(inout self, config: Config) raises:
         self.x = TensorF32(config.dim)
         self.xb = TensorF32(config.dim)
@@ -436,13 +441,7 @@ struct TransformerWeights:
         fn load_weights(inout buf: FileBuf, *dims: Int) raises -> TensorF32:
             # Ensure returned Tensor doesn't share a pointer with FileBuf
             let shape = TensorShape(dims)
-            let result_data = BufferPtrFloat32.alloc(shape.num_elements())
-            memcpy(
-                result_data,
-                buf.bitcast_offset_f32(shape.num_elements()),
-                shape.num_elements(),
-            )
-            return TensorF32(result_data, shape)
+            return TensorF32(buf.bitcast_offset_f32(shape.num_elements()), shape)
 
         self.token_embedding_table = load_weights(buf, config.vocab_size, config.dim)
         self.rms_att_weight = load_weights(buf, config.n_layers, config.dim)
@@ -463,6 +462,23 @@ struct TransformerWeights:
             self.wcls = self.token_embedding_table
         else:
             self.wcls = load_weights(buf, config.vocab_size, config.dim)
+
+    fn overwrite_pointers(inout self):
+        # overwrite pointers to shared weights so we can't free them
+        self.token_embedding_table._ptr = BufferPtrFloat32.get_null()
+        self.rms_att_weight._ptr = BufferPtrFloat32.get_null()
+        self.wq._ptr = BufferPtrFloat32.get_null()
+        self.wk._ptr = BufferPtrFloat32.get_null()
+        self.wv._ptr = BufferPtrFloat32.get_null()
+        self.wo._ptr = BufferPtrFloat32.get_null()
+        self.rms_ffn_weight._ptr = BufferPtrFloat32.get_null()
+        self.w1._ptr = BufferPtrFloat32.get_null()
+        self.w2._ptr = BufferPtrFloat32.get_null()
+        self.w3._ptr = BufferPtrFloat32.get_null()
+        self.rms_final_weight._ptr = BufferPtrFloat32.get_null()
+        self.freq_cis_real._ptr = BufferPtrFloat32.get_null()
+        self.freq_cis_imag._ptr = BufferPtrFloat32.get_null()
+        self.wcls._ptr = BufferPtrFloat32.get_null()
 
 
 fn read_file(file_name: String, inout buf: FileBuf) raises:
@@ -486,7 +502,7 @@ fn config_init(inout config: Config, inout buf: FileBuf, print_config: Int = 0) 
     config.head_size = config.dim // config.n_heads
     config.kv_dim = (config.n_kv_heads * config.dim) // config.n_heads
     config.kv_mul = config.n_heads // config.n_kv_heads
-    
+
     if print_config:
         print("config: dim, hidden_dim", config.dim, config.hidden_dim)
         print("config: n_layers, n_heads", config.n_layers, config.n_heads)
@@ -571,6 +587,7 @@ fn softmax(inout x: TensorF32, start: Int, end: Int):
     vectorize[nelts, _exp](end - start)
 
     var ssum = acc.total()
+
     @parameter
     fn _norm[_nelts: Int](ii: Int):
         x.simd_store[_nelts](start + ii, x.simd_load[_nelts](start + ii) / ssum)
@@ -591,6 +608,7 @@ fn batch_matmul[
     @parameter
     fn compute_row(i: Int):
         var tmp = StaticTuple[n, Accumulator[DType.float32, nelts]]()
+
         @unroll
         for k in range(n):
             tmp[k] = Accumulator[DType.float32, nelts]()
@@ -645,7 +663,9 @@ fn matmul(C: TensorSlice, A: TensorF32, B: TensorSlice) raises:
     # B (d,n) @ A (n,) -> C (d,)
     matmul_dimension_checks(A.shape(), B.shape())
     batch_matmul[1](
-        StaticTuple[1, BufferPtrFloat32](C.data(),),
+        StaticTuple[1, BufferPtrFloat32](
+            C.data(),
+        ),
         A.data(),
         StaticTuple[1, BufferPtrFloat32](B.data()),
         B.dim(0),
@@ -673,8 +693,9 @@ fn rope_rotation_llama(
 ) -> None:
     # stories model, llama2
     let head_size = config.head_size
+
     @parameter
-    fn head_loop(i:Int):
+    fn head_loop(i: Int):
         # Simple vectorization with (head_size // 2) steps gave junk transformer output.
         # Maybe because the nelt ranges end up overlapping between the steps.
         for j in range(0, config.head_size, 2):
@@ -689,8 +710,8 @@ fn rope_rotation_llama(
                 let k1 = state.k[i * head_size + j + 1]
                 state.k[i * head_size + j] = k0 * fcr - k1 * fci
                 state.k[i * head_size + j + 1] = k0 * fci + k1 * fcr
-    parallelize[head_loop](config.n_heads, workers)
 
+    parallelize[head_loop](config.n_heads, workers)
 
 
 @always_inline
@@ -757,7 +778,7 @@ fn transformer(
 
         # Multihead attention. Iterate over all heads in parallel.
         @parameter
-        fn loop_over_heads(h:Int):
+        fn loop_over_heads(h: Int):
             # Get the query vector for this head
             let q_offset = h * head_size
 
@@ -1015,7 +1036,7 @@ fn main() raises:
         -config.vocab_size if config.vocab_size < 0 else config.vocab_size
     )
 
-    let weights: TransformerWeights = TransformerWeights(config, shared_weights, fbuf)
+    var weights: TransformerWeights = TransformerWeights(config, shared_weights, fbuf)
 
     if steps <= 0 or steps > config.seq_len:
         steps = config.seq_len
@@ -1025,8 +1046,17 @@ fn main() raises:
     var tok = Tokenizer(config.vocab_size, tbuf)
 
     # print the layers number and vocab size
-    print("checkpoint size: ", fbuf.size, "[", fbuf.size // 1024 // 1024, "MB ]", 
-        "| n layers:", config.n_layers, "| vocab size:", tok.vocab_size)
+    print(
+        "checkpoint size: ",
+        fbuf.size,
+        "[",
+        fbuf.size // 1024 // 1024,
+        "MB ]",
+        "| n layers:",
+        config.n_layers,
+        "| vocab size:",
+        tok.vocab_size,
+    )
 
     # Create and initialize the application RunState
     var state = RunState(config)
@@ -1082,5 +1112,9 @@ fn main() raises:
         if start == 0:
             start = time_in_ms()
 
+    # stop weights tensors from freeing their pointers.  The FileBuf frees them.
+    weights.overwrite_pointers()
+    # prevent freeing of buffer contain weights pointers
+    _ = (fbuf,)
     let end = time_in_ms()
     print("\nachieved tok/s: ", (pos - 1) / (end - start) * 1000)
