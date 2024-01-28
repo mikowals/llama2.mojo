@@ -1,5 +1,5 @@
 from algorithm import sum
-from algorithm import vectorize, parallelize, unroll
+from algorithm import vectorize, parallelize, unroll, vectorize_unroll
 from builtin import string
 from math import round
 from memory import memset_zero, memcpy, stack_allocation
@@ -29,29 +29,126 @@ alias PointerStrings = Pointer[PointerString]
 alias TensorF32 = Tensor[DType.float32]
 
 
-@register_passable
+fn deinterleave[
+    simd_width: Int
+](v: SIMD[DType.float32, simd_width]) -> StaticTuple[
+    2, SIMD[DType.float32, simd_width // 2]
+]:
+    # Deinterleave a SIMD vector into two SIMD vectors.
+    # The first vector contains the even elements, the second vector contains the odd elements.
+    # The first vector is returned in the first element of the tuple, the second vector
+    @parameter
+    if simd_width < 2 or simd_width > 32:
+        print(
+            "simd_width can not be less than 2 or greater than 64. Got simd_width:",
+            simd_width,
+            ".",
+        )
+
+    @parameter
+    if simd_width == 32:
+        let deinterleaved = v.shuffle[
+            0,
+            2,
+            4,
+            6,
+            8,
+            10,
+            12,
+            14,
+            16,
+            18,
+            20,
+            22,
+            24,
+            26,
+            28,
+            30,
+            1,
+            3,
+            5,
+            7,
+            9,
+            11,
+            13,
+            15,
+            17,
+            19,
+            21,
+            23,
+            25,
+            27,
+            29,
+            31,
+        ]()
+        return StaticTuple[2, SIMD[DType.float32, simd_width // 2]](
+            deinterleaved.slice[simd_width // 2](),
+            deinterleaved.slice[simd_width // 2](simd_width // 2),
+        )
+    elif simd_width == 16:
+        let deinterleaved = v.shuffle[
+            0,
+            2,
+            4,
+            6,
+            8,
+            10,
+            12,
+            14,
+            1,
+            3,
+            5,
+            7,
+            9,
+            11,
+            13,
+            15,
+        ]()
+        return StaticTuple[2, SIMD[DType.float32, simd_width // 2]](
+            deinterleaved.slice[simd_width // 2](),
+            deinterleaved.slice[simd_width // 2](simd_width // 2),
+        )
+    elif simd_width == 8:
+        let deinterleaved = v.shuffle[0, 2, 4, 6, 1, 3, 5, 7]()
+        return StaticTuple[2, SIMD[DType.float32, simd_width // 2]](
+            deinterleaved.slice[simd_width // 2](),
+            deinterleaved.slice[simd_width // 2](simd_width // 2),
+        )
+    elif simd_width == 4:
+        let deinterleaved = v.shuffle[0, 2, 1, 3]()
+        return StaticTuple[2, SIMD[DType.float32, simd_width // 2]](
+            deinterleaved.slice[simd_width // 2](),
+            deinterleaved.slice[simd_width // 2](simd_width // 2),
+        )
+
+    return StaticTuple[2, SIMD[DType.float32, simd_width // 2]](
+        v.slice[simd_width // 2](), v.slice[simd_width // 2](simd_width // 2)
+    )
+
+
+@register_passable("trivial")
 struct Accumulator[T: DType, width: Int]:
     # ideally this could be SIMD[T, width] but the width
     # in accumulate() method is compared by identity
-    var data: DTypePointer[T]
+    var data: SIMD[T, width]
 
     @always_inline
     fn __init__() -> Self:
         # allocate a DTypePointer on stack that doesn't need to be freed.
-        let data = stack_allocation[width, T]()
-        memset_zero(data, width)
-        return Self {data: data}
+        return Self {
+            data: SIMD[T, width](0),
+        }
 
     @always_inline
     fn accumulate[_width: Int](inout self, val: SIMD[T, _width]) -> None:
-        # This is a hack to make sure both SIMD have _width length.
-        # SIMD[T, width] += SIMD[T, _width] is always an error.
-        let newVal = self.data.simd_load[_width]() + val
-        self.data.simd_store[_width](newVal)
+        @parameter
+        if _width == width:
+            self.data += rebind[SIMD[T, width], SIMD[T, _width]](val)
+        else:
+            self.data[0] += val.reduce_add()
 
-    @always_inline
     fn total(self) -> SIMD[T, 1]:
-        return self.data.simd_load[width]().reduce_add()
+        return self.data.reduce_add()
 
 
 struct TensorSlice:
@@ -214,20 +311,12 @@ fn partition(
             # If element smaller than pivot, swap
             ii = ii + 1
 
-            let tmp = array[ii]
-            let tmp_idx = indices[ii]
-            array.store(ii, array[jj])
-            indices[ii] = indices[jj]
-            array.store(jj, tmp)
-            indices[jj] = tmp_idx
+            array[ii], array[jj] = array[jj], array[ii]
+            indices[ii], indices[jj] = indices[jj], indices[ii]
 
     # Swap the pivot element
-    let tmp = array[ii + 1]
-    let tmp_idx = indices[ii + 1]
-    array.store(ii + 1, array[high])
-    indices[ii + 1] = indices[high]
-    array.store(high, tmp)
-    indices[high] = tmp_idx
+    array[ii + 1], array[high] = array[high], array[ii + 1]
+    indices[ii + 1], indices[high] = indices[high], indices[ii + 1]
 
     return ii + 1
 
@@ -694,18 +783,32 @@ fn rope_rotation_llama(
     fn head_loop(i: Int):
         # Simple vectorization with (head_size // 2) steps gave junk transformer output.
         # Maybe because the nelt ranges end up overlapping between the steps.
-        for j in range(0, config.head_size, 2):
-            let fcr = freq_cis_real_row[j // 2]
-            let fci = freq_cis_imag_row[j // 2]
-            let q0 = state.q[i * head_size + j]
-            let q1 = state.q[i * head_size + j + 1]
-            state.q[i * head_size + j] = q0 * fcr - q1 * fci
-            state.q[i * head_size + j + 1] = q0 * fci + q1 * fcr
+        let half_head_size = config.head_size // 2
+
+        @parameter
+        fn inner_loop[_nelts: Int](k: Int):
+            let j = k * 2
+            let fcr = freq_cis_real_row.simd_load[_nelts](k)
+            let fci = freq_cis_imag_row.simd_load[_nelts](k)
+            let q = rebind[StaticTuple[2, SIMD[DType.float32, _nelts]]](
+                deinterleave[_nelts * 2](
+                    state.q.simd_load[_nelts * 2](i * head_size + j)
+                )
+            )
+            let new_q = (q[0] * fcr - q[1] * fci).interleave(q[0] * fci + q[1] * fcr)
+            state.q.simd_store[2 * _nelts](i * head_size + j, new_q)
             if i < config.n_kv_heads:
-                let k0 = state.k[i * head_size + j]
-                let k1 = state.k[i * head_size + j + 1]
-                state.k[i * head_size + j] = k0 * fcr - k1 * fci
-                state.k[i * head_size + j + 1] = k0 * fci + k1 * fcr
+                let k = rebind[StaticTuple[2, SIMD[DType.float32, _nelts]]](
+                    deinterleave[_nelts * 2](
+                        state.k.simd_load[_nelts * 2](i * head_size + j)
+                    )
+                )
+                let new_k = (k[0] * fcr - k[1] * fci).interleave(
+                    k[0] * fci + k[1] * fcr
+                )
+                state.k.simd_store[2 * _nelts](i * head_size + j, new_k)
+
+        vectorize[nelts, inner_loop](half_head_size)
 
     parallelize[head_loop](config.n_heads, workers)
 
@@ -786,17 +889,17 @@ fn transformer(
                 # Starting index of the key vector for this head and at this timestep
                 let k_offset = loff + t * kv_dim + (h // kv_mul) * head_size
                 # Calculate the attention score as the dot product of q and k
-                var score: Float32 = 0.0
+                var tmp_score = Accumulator[DType.float32, nelts]()
 
                 @parameter
                 fn score_fn[_nelts: Int](i: Int):
-                    score += (
+                    tmp_score.accumulate(
                         state.q.simd_load[_nelts](q_offset + i)
                         * state.key_cache.simd_load[_nelts](k_offset + i)
-                    ).reduce_add()
+                    )
 
                 vectorize[nelts, score_fn](head_size)
-                score /= math.sqrt[DType.float32, 1](head_size)
+                var score = tmp_score.total() / math.sqrt[DType.float32, 1](head_size)
 
                 # Save the score to the attention buffer
                 state.att[att_offset + t] = score
@@ -805,6 +908,7 @@ fn transformer(
             softmax(state.att, att_offset, att_offset + pos + 1)
             # Weighted sum of the values, store back into xb
             let xb_offset = h * head_size
+
             for t in range(pos + 1):
                 # Starting index of the value vector for this head and at this timestep
                 let v_offset = loff + t * kv_dim + (h // kv_mul) * head_size
@@ -864,13 +968,44 @@ fn transformer(
 
 
 fn argmax(v: TensorF32) -> Int:
-    # return argmax of v
-    var max_i: Int = 0
-    var max_p: Float32 = v[0]
-    for i in range(v.dim(0)):
+    let n = v.dim(0)
+    var max_i = 0
+    var max_p = v[0]
+    for i in range(1, n):
         if v[i] > max_p:
             max_i = i
             max_p = v[i]
+    return max_i
+
+
+fn argmax2(v: TensorF32) -> Int:
+    alias workers = 6
+    let section_size = v.dim(0) // workers
+    var range_max = StaticTuple[workers, Float32]()
+    var range_max_idx = StaticIntTuple[workers]()
+
+    @parameter
+    fn _max(section: Int):
+        let start = section * section_size
+        let end = v.dim(0) if section == workers - 1 else (section + 1) * section_size
+        range_max[section] = v[start]
+        range_max_idx[section] = start
+        for idx in range(start + 1, end):
+            let val = v[idx]
+            if val > range_max[section]:
+                range_max[section] = val
+                range_max_idx[section] = idx
+
+    parallelize[_max](workers, workers)
+    # return argmax of v
+    var max_i = range_max_idx[0]
+    var max_p = range_max[0]
+
+    @unroll
+    for section in range(1, workers):
+        if range_max[section] > max_p:
+            max_i = range_max_idx[section]
+            max_p = range_max[section]
     return max_i
 
 
@@ -1053,8 +1188,7 @@ fn main() raises:
     var token = 1
 
     # Position in the sequence
-    var pos = 0
-    while pos < steps:
+    for pos in range(steps):
         # Forward the transformer to get logits for the next token
         transformer(token, pos, config, state, weights)
 
@@ -1064,7 +1198,7 @@ fn main() raises:
             # Sample the next token
             if temperature == 0.0:
                 # Greedy argmax sampling: take the token with the highest probability
-                next_token = argmax(state.logits)
+                next_token = argmax2(state.logits)
             else:
                 # Apply the temperature to the logits
                 for q in range(config.vocab_size):
@@ -1086,10 +1220,9 @@ fn main() raises:
 
         # Advance forward
         token = next_token
-        pos += 1
 
         if start == 0:
             start = time_in_ms()
 
     let end = time_in_ms()
-    print("\nachieved tok/s: ", (pos - 1) / (end - start) * 1000)
+    print("\nachieved tok/s: ", (steps - 1) / (end - start) * 1000)
