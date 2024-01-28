@@ -6,7 +6,7 @@ from memory import memset_zero, memcpy, stack_allocation
 from memory.buffer import Buffer
 from memory.unsafe import DTypePointer
 from random import rand
-from runtime.llcl import num_cores
+from sys.info import num_performance_cores
 from sys import argv
 from tensor import Tensor, TensorShape, TensorSpec
 
@@ -950,7 +950,7 @@ fn print_usage():
 
 
 fn main() raises:
-    workers = num_cores()
+    workers = num_performance_cores()
     var tokenizer = StringRef("tokenizer.bin")
     var checkpoint = StringRef("stories15M.bin")
     var temperature = 0.9
