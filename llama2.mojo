@@ -779,8 +779,7 @@ fn rope_rotation_llama(
     # stories model, llama2
     let head_size = config.head_size
 
-    @parameter
-    fn head_loop(i: Int):
+    for i in range(config.n_heads):
         # Simple vectorization with (head_size // 2) steps gave junk transformer output.
         # Maybe because the nelt ranges end up overlapping between the steps.
         let half_head_size = config.head_size // 2
@@ -809,8 +808,6 @@ fn rope_rotation_llama(
                 state.k.simd_store[2 * _nelts](i * head_size + j, new_k)
 
         vectorize[nelts, inner_loop](half_head_size)
-
-    parallelize[head_loop](config.n_heads, workers)
 
 
 @always_inline
