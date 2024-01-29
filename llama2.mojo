@@ -778,11 +778,8 @@ fn rope_rotation_llama(
 ) -> None:
     # stories model, llama2
     let head_size = config.head_size
-
-    for i in range(config.n_heads):
-        # Simple vectorization with (head_size // 2) steps gave junk transformer output.
-        # Maybe because the nelt ranges end up overlapping between the steps.
-        let half_head_size = config.head_size // 2
+    let half_head_size = config.head_size // 2
+    for i in range(config.n_kv_heads):
 
         @parameter
         fn inner_loop[_nelts: Int](k: Int):
@@ -796,18 +793,34 @@ fn rope_rotation_llama(
             )
             let new_q = (q[0] * fcr - q[1] * fci).interleave(q[0] * fci + q[1] * fcr)
             state.q.simd_store[2 * _nelts](i * head_size + j, new_q)
-            if i < config.n_kv_heads:
-                let k = rebind[StaticTuple[2, SIMD[DType.float32, _nelts]]](
-                    deinterleave[_nelts * 2](
-                        state.k.simd_load[_nelts * 2](i * head_size + j)
-                    )
+            let k_pair = rebind[StaticTuple[2, SIMD[DType.float32, _nelts]]](
+                deinterleave[_nelts * 2](
+                    state.k.simd_load[_nelts * 2](i * head_size + j)
                 )
-                let new_k = (k[0] * fcr - k[1] * fci).interleave(
-                    k[0] * fci + k[1] * fcr
-                )
-                state.k.simd_store[2 * _nelts](i * head_size + j, new_k)
+            )
+            let new_k = (k_pair[0] * fcr - k_pair[1] * fci).interleave(
+                k_pair[0] * fci + k_pair[1] * fcr
+            )
+            state.k.simd_store[2 * _nelts](i * head_size + j, new_k)
 
         vectorize[nelts, inner_loop](half_head_size)
+
+    for i in range(config.n_kv_heads, config.n_heads):
+
+        @parameter
+        fn inner_loop_q[_nelts: Int](k: Int):
+            let j = k * 2
+            let fcr = freq_cis_real_row.simd_load[_nelts](k)
+            let fci = freq_cis_imag_row.simd_load[_nelts](k)
+            let q = rebind[StaticTuple[2, SIMD[DType.float32, _nelts]]](
+                deinterleave[_nelts * 2](
+                    state.q.simd_load[_nelts * 2](i * head_size + j)
+                )
+            )
+            let new_q = (q[0] * fcr - q[1] * fci).interleave(q[0] * fci + q[1] * fcr)
+            state.q.simd_store[2 * _nelts](i * head_size + j, new_q)
+
+        vectorize[nelts, inner_loop_q](half_head_size)
 
 
 @always_inline
